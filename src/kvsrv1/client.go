@@ -81,7 +81,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	var send_times uint8 = 0
+	retried := false
 	for {
 		args := rpc.PutArgs{}
 		args.Key = key
@@ -91,8 +91,8 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 		reply := rpc.PutReply{}
 
 		ok := ck.clnt.Call(ck.server, "KVServer.Put", args, &reply)
-		send_times++
 		if !ok {
+			retried = true
 			continue
 		}
 
@@ -102,7 +102,7 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 		case rpc.ErrNoKey:
 			return reply.Err
 		case rpc.ErrVersion:
-			if send_times > 1 {
+			if retried {
 				return rpc.ErrMaybe
 			} else {
 				return rpc.ErrVersion
