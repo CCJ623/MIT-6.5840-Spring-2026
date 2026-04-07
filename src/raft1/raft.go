@@ -109,8 +109,7 @@ func (rf *Raft) commit() {
 	}
 
 	// build a sorted copy of match indices; treat self as fully matched
-	matched := make([]uint64, len(rf.peers))
-	copy(matched, rf.match_index_)
+	matched := slices.Clone(rf.match_index_)
 	matched[rf.me] = uint64(len(rf.logs_) - 1)
 	slices.SortFunc(matched, func(a, b uint64) int {
 		if a > b {
@@ -423,13 +422,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	// follower reply success
 	logs_length := len(args.Entries_)
-	rf.match_index_[server] += uint64(logs_length)
-	rf.next_index_[server] = rf.match_index_[server] + 1
+	new_match := args.PreviousLogIndex_ + uint64(logs_length)
+	if new_match > rf.match_index_[server] {
+		rf.match_index_[server] = new_match
+		rf.next_index_[server] = rf.match_index_[server] + 1
+	}
 	if logs_length > 0 {
 		rf.debugf("AppendEntries success for %v, updated match_index to %v", server, rf.match_index_[server])
-		rf.mu.Unlock()
-		rf.commit()
-		rf.mu.Lock()
+		go rf.commit()
 	}
 }
 
