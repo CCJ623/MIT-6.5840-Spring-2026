@@ -30,7 +30,7 @@ const (
 )
 
 type LogEntry struct {
-	Command_ string
+	Command_ interface{}
 	Term_    uint64
 }
 
@@ -201,6 +201,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.voted_for_ = args.Candidate_ID_
 		rf.current_term_ = args.Term_
 		rf.last_heartbeat_time_ = time.Now()
+		rf.persist()
 
 		reply.Term_ = rf.current_term_
 		reply.VoteGranted_ = true
@@ -271,7 +272,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.debugf("received AppendEntries from %v for term %v", args.LeaderID_, args.Term_)
+	rf.debugf("received AppendEntries from %v: term=%v prevLogIdx=%v prevLogTerm=%v entries=%v leaderCommit=%v",
+		args.LeaderID_, args.Term_, args.PreviousLogIndex_, args.PreviousLogTerm_, len(args.Entries_), args.LeaderCommit_)
 
 	if args.Term_ < rf.current_term_ {
 		// old leader
@@ -283,7 +285,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// receive from right leader, update heartbeat
 	rf.last_heartbeat_time_ = time.Now()
-	if (uint64(len(rf.logs_)) < args.PreviousLogIndex_) ||
+	if (uint64(len(rf.logs_)) <= args.PreviousLogIndex_) ||
 		(rf.logs_[args.PreviousLogIndex_].Term_ != args.PreviousLogTerm_) {
 		// previous log is wrong
 		rf.debugf("rejecting AppendEntries from %v (prev log wrong)", args.LeaderID_)
@@ -298,12 +300,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if index == uint64(len(rf.logs_)) {
 			// append new entry
 			rf.logs_ = append(rf.logs_, leader_log_entry)
+			rf.debugf("appended new entry at idx=%v term=%v cmd=%v", index, leader_log_entry.Term_, leader_log_entry.Command_)
 			continue
 		}
 
 		curr_log_entry := &rf.logs_[index]
 		if curr_log_entry.Term_ != leader_log_entry.Term_ {
-			// conflit log
+			// conflict: truncate and overwrite
+			rf.debugf("conflict at idx=%v (have term=%v want term=%v), truncating log", index, curr_log_entry.Term_, leader_log_entry.Term_)
 			curr_log_entry.Term_ = leader_log_entry.Term_
 			curr_log_entry.Command_ = leader_log_entry.Command_
 			rf.logs_ = rf.logs_[:index+1]
@@ -313,11 +317,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.LeaderCommit_ > rf.commit_index_ {
+		old_commit := rf.commit_index_
 		// catch up leader's commit index
 		rf.commit_index_ = min(args.LeaderCommit_, uint64(len(rf.logs_))-1)
+		rf.debugf("commit_index advanced from %v to %v (leaderCommit=%v)", old_commit, rf.commit_index_, args.LeaderCommit_)
+		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "commit advanced", fmt.Sprintf("from=%v to=%v", old_commit, rf.commit_index_))
 	}
 
-	rf.debugf("accepted AppendEntries from %v", args.LeaderID_)
+	rf.persist()
+	rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, len(rf.logs_), rf.commit_index_)
 	reply.Success_ = true
 }
 
@@ -339,9 +347,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if rf.current_term_ < reply.Term_ {
 		// i am outdated
 		rf.debugf("AppendEntries reply contained higher term %v, stepping down", reply.Term_)
+		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "stepped down", fmt.Sprintf("saw term=%v from peer=%v", reply.Term_, server))
 		rf.role_ = Follower
 		rf.current_term_ = reply.Term_
 		rf.voted_for_ = -1
+		rf.persist()
 		return
 	}
 
@@ -397,6 +407,7 @@ func (rf *Raft) startElection(election_done chan bool) {
 	rf.persist()
 
 	rf.debugf("startElection for term %v", rf.current_term_)
+	tester.Annotate(fmt.Sprintf("Server %v", rf.me), "election started", fmt.Sprintf("term=%v", rf.current_term_))
 
 	args.Term_ = rf.current_term_
 	args.Candidate_ID_ = rf.me
@@ -435,6 +446,7 @@ func (rf *Raft) startElection(election_done chan bool) {
 				if vote_count > len(rf.peers)/2 {
 					// i am leader now
 					rf.debugf("became leader for term %v", args.Term_)
+					tester.Annotate(fmt.Sprintf("Server %v", rf.me), "became leader", fmt.Sprintf("term=%v votes=%v/%v", args.Term_, vote_count, len(rf.peers)))
 					rf.role_ = Leader
 					go rf.broadcastHeartbeats()
 					rf.mu.Unlock()
@@ -447,9 +459,12 @@ func (rf *Raft) startElection(election_done chan bool) {
 			if reply.Term_ > rf.current_term_ {
 				// i am a loser
 				rf.debugf("stepped down to Follower (reply term %v > current %v)", reply.Term_, rf.current_term_)
+				tester.Annotate(fmt.Sprintf("Server %v", rf.me), "stepped down", fmt.Sprintf("saw term=%v during election", reply.Term_))
 				rf.current_term_ = reply.Term_
 				rf.role_ = Follower
 				rf.voted_for_ = -1
+				rf.persist()
+
 				for index := range rf.next_index_ {
 					rf.next_index_[index] = uint64(len(rf.logs_))
 				}
@@ -481,23 +496,54 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	rf.debugf("Start() called with command %v", command)
-
 	// Your code here (3B).
-	// if rf.role_ != Leader{
-	// 	// i am not a leader
-	// 	isLeader = false
-	// 	return index, term, isLeader
-	// }
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	// for index := range rf.peers[:rf.me]{
-	// 	args := AppendEntriesArgs{}
-	// 	args.Term_ = rf.current_term_
-	// 	args.LeaderID_ = rf.me
-	// 	args.PreviousLogIndex_ = rf.commit_index_
-	// 	args.PreviousLogTerm_ = rf.logs_[rf.commit_index_].Term_
-	// 			go rf.sendAppendEntries(index, )
-	// }
+	rf.debugf("Start() called with command %v (role=%v term=%v)", command, rf.roleName(), rf.current_term_)
+
+	if rf.role_ != Leader {
+		// i am not a leader
+		isLeader = false
+		index = int(rf.commit_index_)
+		term = int(rf.current_term_)
+		rf.debugf("Start() rejected: not leader")
+		return index, term, isLeader
+	}
+
+	// i am a leader, append log entry
+	rf.logs_ = append(rf.logs_, LogEntry{Command_: command, Term_: rf.current_term_})
+	index = len(rf.logs_) - 1
+	term = int(rf.current_term_)
+	rf.persist()
+	rf.debugf("Start() appended cmd=%v at idx=%v term=%v, log len=%v", command, index, term, len(rf.logs_)-1)
+	tester.Annotate(fmt.Sprintf("Server %v", rf.me), "cmd appended", fmt.Sprintf("idx=%v term=%v cmd=%v", index, term, command))
+
+	for peer_index := range rf.peers {
+		if peer_index == rf.me {
+			continue
+		}
+		previous_log_index := rf.next_index_[peer_index] - 1
+		previous_log_term := rf.logs_[previous_log_index].Term_
+		entries := make([]LogEntry, 0)
+		if rf.next_index_[peer_index] == rf.match_index_[peer_index]+1 {
+			// found our common history
+			entries = rf.logs_[previous_log_index+1:]
+		}
+		rf.debugf("Start() sending %v entries to peer %v (prevIdx=%v prevTerm=%v)", len(entries), peer_index, previous_log_index, previous_log_term)
+		args := AppendEntriesArgs{
+			Term_:             rf.current_term_,
+			LeaderID_:         rf.me,
+			PreviousLogIndex_: previous_log_index,
+			PreviousLogTerm_:  previous_log_term,
+			Entries_:          entries,
+			LeaderCommit_:     rf.commit_index_,
+		}
+		go func() {
+			reply := AppendEntriesReplys{}
+			rf.sendAppendEntries(peer_index, &args, &reply)
+		}()
+	}
 
 	return index, term, isLeader
 }
@@ -518,6 +564,7 @@ func (rf *Raft) ticker() {
 			if rf.role_ == Follower && time.Since(rf.last_heartbeat_time_) >= ELECTION_TIMEOUT {
 				// election timeout, transform to candidate
 				rf.debugf("election timeout, converting to Candidate")
+				tester.Annotate(fmt.Sprintf("Server %v", rf.me), "election timeout", fmt.Sprintf("term=%v", rf.current_term_))
 				rf.role_ = Candidate
 			}
 			rf.mu.Unlock()
