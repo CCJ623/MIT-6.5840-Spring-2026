@@ -12,6 +12,7 @@ import (
 
 	"fmt"
 	"math/rand"
+	"slices"
 	"sync"
 	"time"
 
@@ -83,6 +84,39 @@ func (rf *Raft) debugf(format string, args ...interface{}) {
 	if DEBUG {
 		prefix := fmt.Sprintf("[%v][%v]: ", rf.me, rf.roleName())
 		fmt.Printf(prefix+format+"\n", args...)
+	}
+}
+
+func (rf *Raft) commit() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.role_ != Leader {
+		return
+	}
+
+	// build a sorted copy of match indices; treat self as fully matched
+	matched := make([]uint64, len(rf.peers))
+	copy(matched, rf.match_index_)
+	matched[rf.me] = uint64(len(rf.logs_) - 1)
+	slices.SortFunc(matched, func(a, b uint64) int {
+		if a > b {
+			return -1
+		} else if a < b {
+			return 1
+		}
+		return 0
+	}) // descending
+
+	// sorted[len/2] is the highest index held by a majority:
+	// for N=3: sorted[1] => at least 2 servers have it; for N=5: sorted[2] => at least 3 servers have it
+	majority_index := matched[len(rf.peers)/2]
+
+	if majority_index > rf.commit_index_ && rf.logs_[majority_index].Term_ == rf.current_term_ {
+		old_commit := rf.commit_index_
+		rf.commit_index_ = majority_index
+		rf.debugf("leader commit advanced from %v to %v", old_commit, rf.commit_index_)
+		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "leader commit advanced", fmt.Sprintf("from=%v to=%v", old_commit, rf.commit_index_))
 	}
 }
 
@@ -369,6 +403,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	rf.next_index_[server] = rf.match_index_[server] + 1
 	if logs_length > 0 {
 		rf.debugf("AppendEntries success for %v, updated match_index to %v", server, rf.match_index_[server])
+		rf.mu.Unlock()
+		rf.commit()
+		rf.mu.Lock()
 	}
 }
 
