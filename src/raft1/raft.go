@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -64,7 +63,8 @@ type Raft struct {
 	next_index_  []uint64
 	match_index_ []uint64
 
-	last_heartbeat_time_ time.Time
+	last_heartbeat_time_   time.Time
+	apply_message_channel_ chan raftapi.ApplyMsg
 }
 
 func (rf *Raft) roleName() string {
@@ -84,6 +84,19 @@ func (rf *Raft) debugf(format string, args ...interface{}) {
 	if DEBUG {
 		prefix := fmt.Sprintf("[%v][%v]: ", rf.me, rf.roleName())
 		fmt.Printf(prefix+format+"\n", args...)
+	}
+}
+
+func (rf *Raft) sendCommittedLogsToApplyChannel(committed_logs []LogEntry, start_index int) {
+	for offset := range committed_logs {
+		index := start_index + offset
+		msg := raftapi.ApplyMsg{CommandValid: true,
+			Command:      committed_logs[offset].Command_,
+			CommandIndex: int(index),
+		}
+		rf.debugf("applying msg: index=%v cmd=%v", index, committed_logs[offset].Command_)
+		rf.apply_message_channel_ <- msg
+		rf.debugf("applied msg: index=%v cmd=%v", index, committed_logs[offset].Command_)
 	}
 }
 
@@ -115,8 +128,14 @@ func (rf *Raft) commit() {
 	if majority_index > rf.commit_index_ && rf.logs_[majority_index].Term_ == rf.current_term_ {
 		old_commit := rf.commit_index_
 		rf.commit_index_ = majority_index
+		rf.last_applied_ = rf.commit_index_
+
+		start_index := old_commit + 1
+		recent_commited_logs_range := slices.Clone(rf.logs_[start_index:rf.commit_index_+1])
+		go rf.sendCommittedLogsToApplyChannel(recent_commited_logs_range, int(start_index))
+
 		rf.debugf("leader commit advanced from %v to %v", old_commit, rf.commit_index_)
-		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "leader commit advanced", fmt.Sprintf("from=%v to=%v", old_commit, rf.commit_index_))
+		tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "leader commit advanced", fmt.Sprintf("from=%v to=%v", old_commit, rf.commit_index_))
 	}
 }
 
@@ -319,6 +338,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// receive from right leader, update heartbeat
 	rf.last_heartbeat_time_ = time.Now()
+	rf.role_ = Follower
 	if (uint64(len(rf.logs_)) <= args.PreviousLogIndex_) ||
 		(rf.logs_[args.PreviousLogIndex_].Term_ != args.PreviousLogTerm_) {
 		// previous log is wrong
@@ -354,12 +374,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		old_commit := rf.commit_index_
 		// catch up leader's commit index
 		rf.commit_index_ = min(args.LeaderCommit_, uint64(len(rf.logs_))-1)
+		start_index := old_commit + 1
+		recent_commited_logs_range := slices.Clone(rf.logs_[start_index:rf.commit_index_+1])
+		go rf.sendCommittedLogsToApplyChannel(recent_commited_logs_range, int(start_index))
+
 		rf.debugf("commit_index advanced from %v to %v (leaderCommit=%v)", old_commit, rf.commit_index_, args.LeaderCommit_)
-		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "commit advanced", fmt.Sprintf("from=%v to=%v", old_commit, rf.commit_index_))
+		tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "commit advanced", fmt.Sprintf("from=%v to=%v", old_commit, rf.commit_index_))
 	}
 
 	rf.persist()
-	rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, len(rf.logs_), rf.commit_index_)
+	rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, len(rf.logs_)-1, rf.commit_index_)
 	reply.Success_ = true
 }
 
@@ -381,7 +405,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if rf.current_term_ < reply.Term_ {
 		// i am outdated
 		rf.debugf("AppendEntries reply contained higher term %v, stepping down", reply.Term_)
-		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "stepped down", fmt.Sprintf("saw term=%v from peer=%v", reply.Term_, server))
+		tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "stepped down", fmt.Sprintf("saw term=%v from peer=%v", reply.Term_, server))
 		rf.role_ = Follower
 		rf.current_term_ = reply.Term_
 		rf.voted_for_ = -1
@@ -444,7 +468,7 @@ func (rf *Raft) startElection(election_done chan bool) {
 	rf.persist()
 
 	rf.debugf("startElection for term %v", rf.current_term_)
-	tester.Annotate(fmt.Sprintf("Server %v", rf.me), "election started", fmt.Sprintf("term=%v", rf.current_term_))
+	tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "election started", fmt.Sprintf("term=%v", rf.current_term_))
 
 	args.Term_ = rf.current_term_
 	args.Candidate_ID_ = rf.me
@@ -483,7 +507,7 @@ func (rf *Raft) startElection(election_done chan bool) {
 				if vote_count > len(rf.peers)/2 {
 					// i am leader now
 					rf.debugf("became leader for term %v", args.Term_)
-					tester.Annotate(fmt.Sprintf("Server %v", rf.me), "became leader", fmt.Sprintf("term=%v votes=%v/%v", args.Term_, vote_count, len(rf.peers)))
+					tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "became leader", fmt.Sprintf("term=%v votes=%v/%v", args.Term_, vote_count, len(rf.peers)))
 					rf.role_ = Leader
 					go rf.broadcastHeartbeats()
 					rf.mu.Unlock()
@@ -496,7 +520,7 @@ func (rf *Raft) startElection(election_done chan bool) {
 			if reply.Term_ > rf.current_term_ {
 				// i am a loser
 				rf.debugf("stepped down to Follower (reply term %v > current %v)", reply.Term_, rf.current_term_)
-				tester.Annotate(fmt.Sprintf("Server %v", rf.me), "stepped down", fmt.Sprintf("saw term=%v during election", reply.Term_))
+				tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "stepped down", fmt.Sprintf("saw term=%v during election", reply.Term_))
 				rf.current_term_ = reply.Term_
 				rf.role_ = Follower
 				rf.voted_for_ = -1
@@ -554,7 +578,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = int(rf.current_term_)
 	rf.persist()
 	rf.debugf("Start() appended cmd=%v at idx=%v term=%v, log len=%v", command, index, term, len(rf.logs_)-1)
-	tester.Annotate(fmt.Sprintf("Server %v", rf.me), "cmd appended", fmt.Sprintf("idx=%v term=%v cmd=%v", index, term, command))
+	tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "cmd appended", fmt.Sprintf("idx=%v term=%v cmd=%v", index, term, command))
 
 	for peer_index := range rf.peers {
 		if peer_index == rf.me {
@@ -601,7 +625,7 @@ func (rf *Raft) ticker() {
 			if rf.role_ == Follower && time.Since(rf.last_heartbeat_time_) >= ELECTION_TIMEOUT {
 				// election timeout, transform to candidate
 				rf.debugf("election timeout, converting to Candidate")
-				tester.Annotate(fmt.Sprintf("Server %v", rf.me), "election timeout", fmt.Sprintf("term=%v", rf.current_term_))
+				tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "election timeout", fmt.Sprintf("term=%v", rf.current_term_))
 				rf.role_ = Candidate
 			}
 			rf.mu.Unlock()
@@ -680,6 +704,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.apply_message_channel_ = applyCh
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
