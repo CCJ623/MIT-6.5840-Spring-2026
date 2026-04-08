@@ -114,13 +114,17 @@ func (rf *Raft) applier() {
 		rf.mu.Unlock()
 		for offset, entry := range entries {
 			index := int(start) + offset
+			rf.mu.Lock()
 			rf.debugf("applying msg: index=%v cmd=%v", index, entry.Command_)
+			rf.mu.Unlock()
 			rf.apply_message_channel_ <- raftapi.ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command_,
 				CommandIndex: index,
 			}
+			rf.mu.Lock()
 			rf.debugf("applied msg: index=%v cmd=%v", index, entry.Command_)
+			rf.mu.Unlock()
 		}
 		rf.mu.Lock()
 	}
@@ -539,7 +543,9 @@ func (rf *Raft) entriesSender() {
 }
 
 func (rf *Raft) broadcastHeartbeats() {
+	rf.mu.Lock()
 	rf.debugf("broadcasting heartbeats for term %v", rf.current_term_)
+	rf.mu.Unlock()
 	rf.send_entries_cond_.Signal()
 }
 
@@ -710,15 +716,21 @@ func (rf *Raft) ticker() {
 			}
 			rf.mu.Unlock()
 			// start election
+			rf.mu.Lock()
 			rf.debugf("starting election")
+			rf.mu.Unlock()
 			election_done := make(chan bool, 1)
 			rf.startElection(election_done)
 
 			select {
 			case <-election_done:
+				rf.mu.Lock()
 				rf.debugf("election done")
+				rf.mu.Unlock()
 			case <-time.After(ELECTION_TIMEOUT):
+				rf.mu.Lock()
 				rf.debugf("election timeout")
+				rf.mu.Unlock()
 			}
 		case Leader:
 			rf.mu.Unlock()
