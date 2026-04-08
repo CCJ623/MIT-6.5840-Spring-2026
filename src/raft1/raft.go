@@ -35,7 +35,9 @@ type LogEntry struct {
 }
 
 const HEARTBEAT_INTERVAL = 100 * time.Millisecond
-const ELECTION_TIMEOUT = 500 * time.Millisecond
+const ELECTION_TIMEOUT = 300 * time.Millisecond
+const RANDOM_SLEEP_MIN = 150 * time.Millisecond
+const RANDOM_SLEEP_MAX = 300 * time.Millisecond
 const DEBUG = false
 
 // A Go object implementing a single Raft peer.
@@ -66,6 +68,7 @@ type Raft struct {
 	last_heartbeat_time_   time.Time
 	apply_message_channel_ chan raftapi.ApplyMsg
 	apply_cond_            *sync.Cond
+	send_entries_cond_     *sync.Cond
 }
 
 func (rf *Raft) roleName() string {
@@ -86,6 +89,16 @@ func (rf *Raft) debugf(format string, args ...interface{}) {
 		prefix := fmt.Sprintf("[%v][%v]: ", rf.me, rf.roleName())
 		fmt.Printf(prefix+format+"\n", args...)
 	}
+}
+
+func randomSleep(min_time time.Duration, max_time time.Duration) {
+	if max_time <= min_time {
+		return
+	}
+
+	time_range := max_time - min_time
+	sleep_time := int64(min_time) + (rand.Int63() % int64(time_range))
+	time.Sleep(time.Duration(sleep_time))
 }
 
 func (rf *Raft) applier() {
@@ -241,32 +254,57 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.debugf("received RequestVote from %v for term %v", args.Candidate_ID_, args.Term_)
 
+	if args.Term_ < rf.current_term_ {
+		// candidate is behind
+		rf.debugf("rejecting RequestVote from %v (term %v < current %v)", args.Candidate_ID_, args.Term_, rf.current_term_)
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "vote rejected(stale term)", fmt.Sprintf("role=%v term=%v candidate=%v candidateTerm=%v", rf.roleName(), rf.current_term_, args.Candidate_ID_, args.Term_))
+		reply.Term_ = rf.current_term_
+		reply.VoteGranted_ = false
+		return
+	}
 	if args.Term_ > rf.current_term_ {
 		// i am outdated
 		// get into a new term
+		rf.debugf("stepping down: saw higher term %v from candidate %v", args.Term_, args.Candidate_ID_)
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "stepped down(RequestVote)", fmt.Sprintf("role=%v term=%v->%v from peer=%v", rf.roleName(), rf.current_term_, args.Term_, args.Candidate_ID_))
 		rf.current_term_ = args.Term_
 		rf.role_ = Follower
 		rf.voted_for_ = -1
 		rf.persist()
 	}
-	if args.Term_ < rf.current_term_ {
-		// candidate is behind
-		rf.debugf("rejecting RequestVote from %v (term %v < current %v)", args.Candidate_ID_, args.Term_, rf.current_term_)
+
+	// reach here, rf.current_term == args.Term_
+	if rf.voted_for_ == args.Candidate_ID_ {
+		// i already vote for it, replicated vote request
+		rf.debugf("already voted for %v, granting again", args.Candidate_ID_)
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "vote granted(dup)", fmt.Sprintf("role=%v term=%v candidate=%v", rf.roleName(), rf.current_term_, args.Candidate_ID_))
+		reply.VoteGranted_ = true
+		rf.last_heartbeat_time_ = time.Now()
+		return
+	}
+	if rf.voted_for_ != -1 {
+		// i already voted for someone else
+		rf.debugf("rejecting RequestVote from %v (already voted for %v)", args.Candidate_ID_, rf.voted_for_)
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "vote rejected(already voted)", fmt.Sprintf("role=%v term=%v candidate=%v votedFor=%v", rf.roleName(), rf.current_term_, args.Candidate_ID_, rf.voted_for_))
 		reply.Term_ = rf.current_term_
 		reply.VoteGranted_ = false
 		return
 	}
-	// reach here, rf.current_term == args.Term_
-	if rf.voted_for_ != -1 && rf.voted_for_ != args.Candidate_ID_{
-		// i already voted for someone else
-		rf.debugf("rejecting RequestVote from %v (already voted for %v)", args.Candidate_ID_, rf.voted_for_)
+	if args.LastLogTerm_ > rf.logs_[len(rf.logs_)-1].Term_ {
+		// candidate's log is ahead, grant vote
+		rf.debugf("granting RequestVote to %v (candidate last log term %v > my last log term %v)", args.Candidate_ID_, args.LastLogTerm_, rf.logs_[len(rf.logs_)-1].Term_)
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "vote granted(candidate log ahead)", fmt.Sprintf("role=%v term=%v candidate=%v candidateLastLogTerm=%v myLastLogTerm=%v", rf.roleName(), rf.current_term_, args.Candidate_ID_, args.LastLogTerm_, rf.logs_[len(rf.logs_)-1].Term_))
+		rf.voted_for_ = args.Candidate_ID_
+		rf.last_heartbeat_time_ = time.Now()
+		rf.persist()
 		reply.Term_ = rf.current_term_
-		reply.VoteGranted_ = false
+		reply.VoteGranted_ = true
 		return
 	}
 	if args.LastLogTerm_ < rf.logs_[len(rf.logs_)-1].Term_ {
 		// candidate's log is behind
 		rf.debugf("rejecting RequestVote from %v (candidate last log term %v < my last log term %v)", args.Candidate_ID_, args.LastLogTerm_, rf.logs_[len(rf.logs_)-1].Term_)
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "vote rejected(log behind)", fmt.Sprintf("role=%v term=%v candidate=%v candidateLastLogTerm=%v myLastLogTerm=%v", rf.roleName(), rf.current_term_, args.Candidate_ID_, args.LastLogTerm_, rf.logs_[len(rf.logs_)-1].Term_))
 		reply.Term_ = rf.current_term_
 		reply.VoteGranted_ = false
 		return
@@ -278,24 +316,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.current_term_ = args.Term_
 		rf.last_heartbeat_time_ = time.Now()
 		rf.persist()
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "vote granted", fmt.Sprintf("role=%v term=%v candidate=%v", rf.roleName(), rf.current_term_, args.Candidate_ID_))
 
 		reply.Term_ = rf.current_term_
 		reply.VoteGranted_ = true
 		return
 	}
-	if rf.voted_for_ == args.Candidate_ID_ {
-		// i already vote for it, replicated vote request
-		rf.debugf("already voted for %v, granting again", args.Candidate_ID_)
-		reply.VoteGranted_ = true
-		rf.last_heartbeat_time_ = time.Now()
-		return
-	}
 
-	// i have already voted for someone else, sorry pal
-	rf.debugf("rejecting RequestVote from %v (already voted for %v)", args.Candidate_ID_, rf.voted_for_)
+	// candidate is not qualified
+	rf.debugf("rejecting RequestVote from %v (not qualified)", args.Candidate_ID_)
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "vote rejected(not qualified)", fmt.Sprintf("role=%v term=%v candidate=%v votedFor=%v", rf.roleName(), rf.current_term_, args.Candidate_ID_, rf.voted_for_))
 	reply.VoteGranted_ = false
 	reply.Term_ = rf.current_term_
-	return
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -435,10 +467,12 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	}
 
 	if !reply.Success_ {
-		// follower is outdated
-		// try to update
-		rf.debugf("AppendEntries failed for %v, backing up next_index", server)
-		rf.next_index_[server]--
+		// follower is outdated, try to update
+		// check to avoid double operation
+		if rf.next_index_[server] > args.PreviousLogIndex_ {
+			rf.debugf("AppendEntries failed for %v, backing up next_index", server)
+			rf.next_index_[server]--
+		}
 		return
 	}
 
@@ -455,27 +489,49 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	}
 }
 
-func (rf *Raft) broadcastHeartbeats() {
-	rf.debugf("broadcasting heartbeats for term %v", rf.current_term_)
-	for index := range rf.peers {
-		if index == rf.me {
+// sync all log entries to followers
+func (rf *Raft) entriesSender() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for true {
+		rf.send_entries_cond_.Wait()
+
+		if rf.role_ != Leader{
+			// do nothing if i ain't leader
 			continue
 		}
-		go func() {
-			rf.mu.Lock()
-			args := &AppendEntriesArgs{
+
+		for peer_index := range rf.peers {
+			if peer_index == rf.me {
+				continue
+			}
+			previous_log_index := rf.next_index_[peer_index] - 1
+			previous_log_term := rf.logs_[previous_log_index].Term_
+			entries := make([]LogEntry, 0)
+			if rf.next_index_[peer_index] == rf.match_index_[peer_index]+1 {
+				// found our common history
+				entries = slices.Clone(rf.logs_[previous_log_index+1:])
+			}
+			rf.debugf("Start() sending %v entries to peer %v (prevIdx=%v prevTerm=%v)", len(entries), peer_index, previous_log_index, previous_log_term)
+			args := AppendEntriesArgs{
 				Term_:             rf.current_term_,
 				LeaderID_:         rf.me,
-				PreviousLogIndex_: rf.next_index_[index] - 1,
-				PreviousLogTerm_:  rf.logs_[rf.next_index_[index]-1].Term_,
-				Entries_:          make([]LogEntry, 0),
+				PreviousLogIndex_: previous_log_index,
+				PreviousLogTerm_:  previous_log_term,
+				Entries_:          entries,
 				LeaderCommit_:     rf.commit_index_,
 			}
-			reply := &AppendEntriesReplys{}
-			rf.mu.Unlock()
-			rf.sendAppendEntries(index, args, reply)
-		}()
+			go func() {
+				reply := AppendEntriesReplys{}
+				rf.sendAppendEntries(peer_index, &args, &reply)
+			}()
+		}
 	}
+}
+
+func (rf *Raft) broadcastHeartbeats() {
+	rf.debugf("broadcasting heartbeats for term %v", rf.current_term_)
+	rf.send_entries_cond_.Signal()
 }
 
 func (rf *Raft) startElection(election_done chan bool) {
@@ -531,6 +587,11 @@ func (rf *Raft) startElection(election_done chan bool) {
 					rf.debugf("became leader for term %v", args.Term_)
 					tester.Annotate(fmt.Sprintf("server%v", rf.me), "became leader", fmt.Sprintf("role=%v term=%v votes=%v/%v", rf.roleName(), args.Term_, vote_count, len(rf.peers)))
 					rf.role_ = Leader
+					for i := range rf.next_index_ {
+						rf.next_index_[i] = rf.commit_index_ + 1
+						rf.match_index_[i] = 0
+					}
+
 					go rf.broadcastHeartbeats()
 					rf.mu.Unlock()
 					election_done <- true
@@ -602,31 +663,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.debugf("Start() appended cmd=%v at idx=%v term=%v, log len=%v", command, index, term, len(rf.logs_)-1)
 	tester.Annotate(fmt.Sprintf("server%v", rf.me), "cmd appended", fmt.Sprintf("role=%v term=%v idx=%v cmd=%v", rf.roleName(), rf.current_term_, index, command))
 
-	for peer_index := range rf.peers {
-		if peer_index == rf.me {
-			continue
-		}
-		previous_log_index := rf.next_index_[peer_index] - 1
-		previous_log_term := rf.logs_[previous_log_index].Term_
-		entries := make([]LogEntry, 0)
-		if rf.next_index_[peer_index] == rf.match_index_[peer_index]+1 {
-			// found our common history
-			entries = slices.Clone(rf.logs_[previous_log_index+1:])
-		}
-		rf.debugf("Start() sending %v entries to peer %v (prevIdx=%v prevTerm=%v)", len(entries), peer_index, previous_log_index, previous_log_term)
-		args := AppendEntriesArgs{
-			Term_:             rf.current_term_,
-			LeaderID_:         rf.me,
-			PreviousLogIndex_: previous_log_index,
-			PreviousLogTerm_:  previous_log_term,
-			Entries_:          entries,
-			LeaderCommit_:     rf.commit_index_,
-		}
-		go func() {
-			reply := AppendEntriesReplys{}
-			rf.sendAppendEntries(peer_index, &args, &reply)
-		}()
-	}
+	rf.send_entries_cond_.Signal()
 
 	return index, term, isLeader
 }
@@ -655,8 +692,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 			// pause for a random amount of time between 50 and 350
 			// milliseconds.
-			ms := 150 + (rand.Int63() % 300)
-			time.Sleep(time.Duration(ms) * time.Millisecond)
+			randomSleep(RANDOM_SLEEP_MIN, RANDOM_SLEEP_MAX)
 
 			rf.mu.Lock()
 			if rf.role_ != Candidate {
@@ -714,14 +750,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commit_index_ = 0
 	rf.last_applied_ = 0
 	rf.apply_cond_ = sync.NewCond(&rf.mu)
+	rf.send_entries_cond_ = sync.NewCond(&rf.mu)
 
 	rf.next_index_ = make([]uint64, len(rf.peers))
+	rf.match_index_ = make([]uint64, len(rf.peers))
 	for i := range rf.next_index_ {
 		rf.next_index_[i] = rf.commit_index_ + 1
-	}
-
-	rf.match_index_ = make([]uint64, len(rf.peers))
-	for i := range rf.match_index_ {
 		rf.match_index_[i] = 0
 	}
 
@@ -733,6 +767,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.applier()
+	go rf.entriesSender()
 
 	return rf
 }
