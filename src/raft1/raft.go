@@ -425,17 +425,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// log is correct, do nothing
 	}
 
-	if args.LeaderCommit_ > rf.commit_index_ {
+	// avoid out of range of rf.logs
+	new_commit_index := min(args.LeaderCommit_, uint64(len(rf.logs_))-1)
+	// avoid out of range of correct log
+	// only args.entries covered is correct
+	new_commit_index = min(new_commit_index, args.PreviousLogIndex_+uint64(len(args.Entries_)))
+
+	if new_commit_index > rf.commit_index_ {
 		old_commit := rf.commit_index_
 		// catch up leader's commit index
-		rf.commit_index_ = min(args.LeaderCommit_, uint64(len(rf.logs_))-1)
+		rf.commit_index_ = new_commit_index
+		rf.persist()
+		rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, len(rf.logs_)-1, rf.commit_index_)
+		reply.Success_ = true
 		rf.apply_cond_.Signal()
 
 		rf.debugf("commit_index advanced from %v to %v (leaderCommit=%v)", old_commit, rf.commit_index_, args.LeaderCommit_)
 		tester.Annotate(fmt.Sprintf("server%v", rf.me), "commit advanced", fmt.Sprintf("role=%v term=%v from=%v to=%v", rf.roleName(), rf.current_term_, old_commit, rf.commit_index_))
 	}
 
-	rf.persist()
+	//rf.persist()
 	rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, len(rf.logs_)-1, rf.commit_index_)
 	reply.Success_ = true
 }
@@ -496,7 +505,7 @@ func (rf *Raft) entriesSender() {
 	for true {
 		rf.send_entries_cond_.Wait()
 
-		if rf.role_ != Leader{
+		if rf.role_ != Leader {
 			// do nothing if i ain't leader
 			continue
 		}
