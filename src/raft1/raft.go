@@ -65,6 +65,7 @@ type Raft struct {
 
 	last_heartbeat_time_   time.Time
 	apply_message_channel_ chan raftapi.ApplyMsg
+	apply_cond_            *sync.Cond
 }
 
 func (rf *Raft) roleName() string {
@@ -87,16 +88,28 @@ func (rf *Raft) debugf(format string, args ...interface{}) {
 	}
 }
 
-func (rf *Raft) sendCommittedLogsToApplyChannel(committed_logs []LogEntry, start_index int) {
-	for offset := range committed_logs {
-		index := start_index + offset
-		msg := raftapi.ApplyMsg{CommandValid: true,
-			Command:      committed_logs[offset].Command_,
-			CommandIndex: int(index),
+func (rf *Raft) applier() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for {
+		for rf.last_applied_ >= rf.commit_index_ {
+			rf.apply_cond_.Wait()
 		}
-		rf.debugf("applying msg: index=%v cmd=%v", index, committed_logs[offset].Command_)
-		rf.apply_message_channel_ <- msg
-		rf.debugf("applied msg: index=%v cmd=%v", index, committed_logs[offset].Command_)
+		start := rf.last_applied_ + 1
+		entries := slices.Clone(rf.logs_[start : rf.commit_index_+1])
+		rf.last_applied_ = rf.commit_index_
+		rf.mu.Unlock()
+		for offset, entry := range entries {
+			index := int(start) + offset
+			rf.debugf("applying msg: index=%v cmd=%v", index, entry.Command_)
+			rf.apply_message_channel_ <- raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command_,
+				CommandIndex: index,
+			}
+			rf.debugf("applied msg: index=%v cmd=%v", index, entry.Command_)
+		}
+		rf.mu.Lock()
 	}
 }
 
@@ -127,11 +140,7 @@ func (rf *Raft) commit() {
 	if majority_index > rf.commit_index_ && rf.logs_[majority_index].Term_ == rf.current_term_ {
 		old_commit := rf.commit_index_
 		rf.commit_index_ = majority_index
-		rf.last_applied_ = rf.commit_index_
-
-		start_index := old_commit + 1
-		recent_commited_logs_range := slices.Clone(rf.logs_[start_index : rf.commit_index_+1])
-		go rf.sendCommittedLogsToApplyChannel(recent_commited_logs_range, int(start_index))
+		rf.apply_cond_.Signal()
 
 		rf.debugf("leader commit advanced from %v to %v", old_commit, rf.commit_index_)
 		tester.Annotate(fmt.Sprintf("server%v", rf.me), "leader commit advanced", fmt.Sprintf("role=%v term=%v from=%v to=%v", rf.roleName(), rf.current_term_, old_commit, rf.commit_index_))
@@ -388,9 +397,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		old_commit := rf.commit_index_
 		// catch up leader's commit index
 		rf.commit_index_ = min(args.LeaderCommit_, uint64(len(rf.logs_))-1)
-		start_index := old_commit + 1
-		recent_commited_logs_range := slices.Clone(rf.logs_[start_index : rf.commit_index_+1])
-		go rf.sendCommittedLogsToApplyChannel(recent_commited_logs_range, int(start_index))
+		rf.apply_cond_.Signal()
 
 		rf.debugf("commit_index advanced from %v to %v (leaderCommit=%v)", old_commit, rf.commit_index_, args.LeaderCommit_)
 		tester.Annotate(fmt.Sprintf("server%v", rf.me), "commit advanced", fmt.Sprintf("role=%v term=%v from=%v to=%v", rf.roleName(), rf.current_term_, old_commit, rf.commit_index_))
@@ -604,7 +611,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		entries := make([]LogEntry, 0)
 		if rf.next_index_[peer_index] == rf.match_index_[peer_index]+1 {
 			// found our common history
-			entries = rf.logs_[previous_log_index+1:]
+			entries = slices.Clone(rf.logs_[previous_log_index+1:])
 		}
 		rf.debugf("Start() sending %v entries to peer %v (prevIdx=%v prevTerm=%v)", len(entries), peer_index, previous_log_index, previous_log_term)
 		args := AppendEntriesArgs{
@@ -706,6 +713,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.commit_index_ = 0
 	rf.last_applied_ = 0
+	rf.apply_cond_ = sync.NewCond(&rf.mu)
 
 	rf.next_index_ = make([]uint64, len(rf.peers))
 	for i := range rf.next_index_ {
@@ -724,6 +732,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applier()
 
 	return rf
 }
