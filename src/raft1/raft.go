@@ -130,11 +130,11 @@ func (rf *Raft) commit() {
 		rf.last_applied_ = rf.commit_index_
 
 		start_index := old_commit + 1
-		recent_commited_logs_range := slices.Clone(rf.logs_[start_index:rf.commit_index_+1])
+		recent_commited_logs_range := slices.Clone(rf.logs_[start_index : rf.commit_index_+1])
 		go rf.sendCommittedLogsToApplyChannel(recent_commited_logs_range, int(start_index))
 
 		rf.debugf("leader commit advanced from %v to %v", old_commit, rf.commit_index_)
-		tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "leader commit advanced", fmt.Sprintf("from=%v to=%v", old_commit, rf.commit_index_))
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "leader commit advanced", fmt.Sprintf("role=%v term=%v from=%v to=%v", rf.roleName(), rf.current_term_, old_commit, rf.commit_index_))
 	}
 }
 
@@ -232,13 +232,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.debugf("received RequestVote from %v for term %v", args.Candidate_ID_, args.Term_)
 
-	if args.Term_ < rf.current_term_ {
-		// candidate is behind
-		rf.debugf("rejecting RequestVote from %v (term %v < current %v)", args.Candidate_ID_, args.Term_, rf.current_term_)
-		reply.Term_ = rf.current_term_
-		reply.VoteGranted_ = false
-		return
-	}
 	if args.Term_ > rf.current_term_ {
 		// i am outdated
 		// get into a new term
@@ -247,7 +240,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.voted_for_ = -1
 		rf.persist()
 	}
-	if rf.voted_for_ == -1 && args.LastLogIndex_ >= rf.commit_index_ {
+	if args.Term_ < rf.current_term_ {
+		// candidate is behind
+		rf.debugf("rejecting RequestVote from %v (term %v < current %v)", args.Candidate_ID_, args.Term_, rf.current_term_)
+		reply.Term_ = rf.current_term_
+		reply.VoteGranted_ = false
+		return
+	}
+	// reach here, rf.current_term == args.Term_
+	if rf.voted_for_ != -1 && rf.voted_for_ != args.Candidate_ID_{
+		// i already voted for someone else
+		rf.debugf("rejecting RequestVote from %v (already voted for %v)", args.Candidate_ID_, rf.voted_for_)
+		reply.Term_ = rf.current_term_
+		reply.VoteGranted_ = false
+		return
+	}
+	if args.LastLogTerm_ < rf.logs_[len(rf.logs_)-1].Term_ {
+		// candidate's log is behind
+		rf.debugf("rejecting RequestVote from %v (candidate last log term %v < my last log term %v)", args.Candidate_ID_, args.LastLogTerm_, rf.logs_[len(rf.logs_)-1].Term_)
+		reply.Term_ = rf.current_term_
+		reply.VoteGranted_ = false
+		return
+	}
+	if args.LastLogIndex_ >= uint64(len(rf.logs_)-1) {
 		// i have not voted and candidate is qualified, i can vote for it
 		rf.debugf("granting RequestVote to %v for term %v", args.Candidate_ID_, args.Term_)
 		rf.voted_for_ = args.Candidate_ID_
@@ -374,11 +389,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// catch up leader's commit index
 		rf.commit_index_ = min(args.LeaderCommit_, uint64(len(rf.logs_))-1)
 		start_index := old_commit + 1
-		recent_commited_logs_range := slices.Clone(rf.logs_[start_index:rf.commit_index_+1])
+		recent_commited_logs_range := slices.Clone(rf.logs_[start_index : rf.commit_index_+1])
 		go rf.sendCommittedLogsToApplyChannel(recent_commited_logs_range, int(start_index))
 
 		rf.debugf("commit_index advanced from %v to %v (leaderCommit=%v)", old_commit, rf.commit_index_, args.LeaderCommit_)
-		tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "commit advanced", fmt.Sprintf("from=%v to=%v", old_commit, rf.commit_index_))
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "commit advanced", fmt.Sprintf("role=%v term=%v from=%v to=%v", rf.roleName(), rf.current_term_, old_commit, rf.commit_index_))
 	}
 
 	rf.persist()
@@ -404,7 +419,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if rf.current_term_ < reply.Term_ {
 		// i am outdated
 		rf.debugf("AppendEntries reply contained higher term %v, stepping down", reply.Term_)
-		tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "stepped down", fmt.Sprintf("saw term=%v from peer=%v", reply.Term_, server))
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "stepped down(AppendEntries)", fmt.Sprintf("role=%v term=%v->%v from peer=%v", rf.roleName(), rf.current_term_, reply.Term_, server))
 		rf.role_ = Follower
 		rf.current_term_ = reply.Term_
 		rf.voted_for_ = -1
@@ -468,7 +483,7 @@ func (rf *Raft) startElection(election_done chan bool) {
 	rf.persist()
 
 	rf.debugf("startElection for term %v", rf.current_term_)
-	tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "election started", fmt.Sprintf("term=%v", rf.current_term_))
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "election started", fmt.Sprintf("role=%v term=%v", rf.roleName(), rf.current_term_))
 
 	args.Term_ = rf.current_term_
 	args.Candidate_ID_ = rf.me
@@ -507,7 +522,7 @@ func (rf *Raft) startElection(election_done chan bool) {
 				if vote_count > len(rf.peers)/2 {
 					// i am leader now
 					rf.debugf("became leader for term %v", args.Term_)
-					tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "became leader", fmt.Sprintf("term=%v votes=%v/%v", args.Term_, vote_count, len(rf.peers)))
+					tester.Annotate(fmt.Sprintf("server%v", rf.me), "became leader", fmt.Sprintf("role=%v term=%v votes=%v/%v", rf.roleName(), args.Term_, vote_count, len(rf.peers)))
 					rf.role_ = Leader
 					go rf.broadcastHeartbeats()
 					rf.mu.Unlock()
@@ -520,7 +535,7 @@ func (rf *Raft) startElection(election_done chan bool) {
 			if reply.Term_ > rf.current_term_ {
 				// i am a loser
 				rf.debugf("stepped down to Follower (reply term %v > current %v)", reply.Term_, rf.current_term_)
-				tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "stepped down", fmt.Sprintf("saw term=%v during election", reply.Term_))
+				tester.Annotate(fmt.Sprintf("server%v", rf.me), "stepped down(Election)", fmt.Sprintf("role=%v term=%v->%v during election", rf.roleName(), rf.current_term_, reply.Term_))
 				rf.current_term_ = reply.Term_
 				rf.role_ = Follower
 				rf.voted_for_ = -1
@@ -578,7 +593,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = int(rf.current_term_)
 	rf.persist()
 	rf.debugf("Start() appended cmd=%v at idx=%v term=%v, log len=%v", command, index, term, len(rf.logs_)-1)
-	tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "cmd appended", fmt.Sprintf("idx=%v term=%v cmd=%v", index, term, command))
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "cmd appended", fmt.Sprintf("role=%v term=%v idx=%v cmd=%v", rf.roleName(), rf.current_term_, index, command))
 
 	for peer_index := range rf.peers {
 		if peer_index == rf.me {
@@ -625,7 +640,7 @@ func (rf *Raft) ticker() {
 			if rf.role_ == Follower && time.Since(rf.last_heartbeat_time_) >= ELECTION_TIMEOUT {
 				// election timeout, transform to candidate
 				rf.debugf("election timeout, converting to Candidate")
-				tester.Annotate(fmt.Sprintf("[%v][%v][%v]", rf.me, rf.roleName(), rf.current_term_), "election timeout", fmt.Sprintf("term=%v", rf.current_term_))
+				tester.Annotate(fmt.Sprintf("server%v", rf.me), "election timeout", fmt.Sprintf("role=%v term=%v", rf.roleName(), rf.current_term_))
 				rf.role_ = Candidate
 			}
 			rf.mu.Unlock()
