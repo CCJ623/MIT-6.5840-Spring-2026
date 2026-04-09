@@ -206,6 +206,8 @@ func (rf *Raft) persist() {
 
 	raft_state := buffer.Bytes()
 	rf.persister.Save(raft_state, nil)
+	rf.debugf("persisted state: term=%v votedFor=%v logLen=%v", rf.current_term_, rf.voted_for_, len(rf.logs_))
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "persisted", fmt.Sprintf("term=%v votedFor=%v logLen=%v", rf.current_term_, rf.voted_for_, len(rf.logs_)))
 }
 
 // restore previously persisted state.
@@ -244,6 +246,8 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.current_term_ = current_term
 	rf.voted_for_ = voted_for
 	rf.logs_ = logs
+	rf.debugf("restored persisted state: term=%v votedFor=%v logLen=%v", rf.current_term_, rf.voted_for_, len(rf.logs_))
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "restored", fmt.Sprintf("term=%v votedFor=%v logLen=%v", rf.current_term_, rf.voted_for_, len(rf.logs_)))
 }
 
 // how many bytes in Raft's persisted log?
