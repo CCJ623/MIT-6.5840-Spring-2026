@@ -10,12 +10,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"fmt"
 	"math/rand"
 	"slices"
 	"sync"
 	"time"
 
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -194,11 +196,21 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+
+	encoder.Encode(rf.current_term_)
+	encoder.Encode(rf.voted_for_)
+	encoder.Encode(rf.logs_)
+
+	raft_state := buffer.Bytes()
+	rf.persister.Save(raft_state, nil)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) < 1 { // bootstrap without any state?
 		return
 	}
 	// Your code here (3C).
@@ -214,6 +226,24 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	buffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buffer)
+
+	var current_term uint64
+	var voted_for int
+	logs := make([]LogEntry, 0)
+
+	if decoder.Decode(&current_term) != nil ||
+	decoder.Decode(&voted_for) != nil ||
+	decoder.Decode(&logs) != nil{
+		// error
+		return
+	}
+
+	rf.current_term_ = current_term
+	rf.voted_for_ = voted_for
+	rf.logs_ = logs
 }
 
 // how many bytes in Raft's persisted log?
@@ -408,11 +438,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// previous log is right, leader found my last correct log entry
 	// now correct my current log
+	is_logs_modified := false
 	for relative_index, leader_log_entry := range args.Entries_ {
 		index := args.PreviousLogIndex_ + 1 + uint64(relative_index)
 		if index == uint64(len(rf.logs_)) {
 			// append new entry
 			rf.logs_ = append(rf.logs_, leader_log_entry)
+			is_logs_modified = true
 			rf.debugf("appended new entry at idx=%v term=%v cmd=%v", index, leader_log_entry.Term_, leader_log_entry.Command_)
 			continue
 		}
@@ -424,9 +456,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			curr_log_entry.Term_ = leader_log_entry.Term_
 			curr_log_entry.Command_ = leader_log_entry.Command_
 			rf.logs_ = rf.logs_[:index+1]
+			is_logs_modified = true
 		}
 
 		// log is correct, do nothing
+	}
+
+	if is_logs_modified{
+		// persist log
+		rf.persist()
 	}
 
 	// avoid out of range of rf.logs
