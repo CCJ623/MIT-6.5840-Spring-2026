@@ -37,7 +37,7 @@ type LogEntry struct {
 }
 
 const HEARTBEAT_INTERVAL = 100 * time.Millisecond
-const ELECTION_TIMEOUT = 300 * time.Millisecond
+const ELECTION_TIMEOUT = 500 * time.Millisecond
 const RANDOM_SLEEP_MIN = 150 * time.Millisecond
 const RANDOM_SLEEP_MAX = 300 * time.Millisecond
 const DEBUG = false
@@ -237,8 +237,8 @@ func (rf *Raft) readPersist(data []byte) {
 	logs := make([]LogEntry, 0)
 
 	if decoder.Decode(&current_term) != nil ||
-	decoder.Decode(&voted_for) != nil ||
-	decoder.Decode(&logs) != nil{
+		decoder.Decode(&voted_for) != nil ||
+		decoder.Decode(&logs) != nil {
 		// error
 		return
 	}
@@ -410,8 +410,11 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReplys struct {
-	Term_    uint64
-	Success_ bool
+	Term_                          uint64
+	Success_                       bool
+	ConflictEntryTerm_             uint64
+	FirstIndexOfConflictEntryTerm_ uint64
+	LogLenth_                      int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReplys) {
@@ -428,20 +431,41 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success_ = false
 		return
 	}
+	if args.Term_ > rf.current_term_ {
+		rf.current_term_ = args.Term_
+		rf.voted_for_ = -1
+		rf.persist()
+	}
 
 	// receive from right leader, update heartbeat
 	rf.last_heartbeat_time_ = time.Now()
 	rf.role_ = Follower
-	if (uint64(len(rf.logs_)) <= args.PreviousLogIndex_) ||
-		(rf.logs_[args.PreviousLogIndex_].Term_ != args.PreviousLogTerm_) {
+
+	if uint64(len(rf.logs_)) <= args.PreviousLogIndex_ {
+		// my log is short
+		rf.debugf("rejecting AppendEntries from %v (my log is short)", args.LeaderID_)
+		reply.Success_ = false
+		reply.LogLenth_ = len(rf.logs_)
+		return
+	}
+
+	if conflict_term := rf.logs_[args.PreviousLogIndex_].Term_; conflict_term != args.PreviousLogTerm_ {
 		// previous log is wrong
 		rf.debugf("rejecting AppendEntries from %v (prev log wrong)", args.LeaderID_)
+		first_conflict_index := args.PreviousLogIndex_
+		for ; rf.logs_[first_conflict_index].Term_ != conflict_term; first_conflict_index-- {
+		}
+
 		reply.Success_ = false
+		reply.LogLenth_ = len(rf.logs_)
+		reply.ConflictEntryTerm_ = conflict_term
+		reply.FirstIndexOfConflictEntryTerm_ = first_conflict_index
 		return
 	}
 
 	// previous log is right, leader found my last correct log entry
 	// now correct my current log
+	reply.Success_ = true
 	is_logs_modified := false
 	for relative_index, leader_log_entry := range args.Entries_ {
 		index := args.PreviousLogIndex_ + 1 + uint64(relative_index)
@@ -466,7 +490,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// log is correct, do nothing
 	}
 
-	if is_logs_modified{
+	if is_logs_modified {
 		// persist log
 		rf.persist()
 	}
@@ -483,16 +507,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commit_index_ = new_commit_index
 		rf.persist()
 		rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, len(rf.logs_)-1, rf.commit_index_)
-		reply.Success_ = true
 		rf.apply_cond_.Signal()
 
 		rf.debugf("commit_index advanced from %v to %v (leaderCommit=%v)", old_commit, rf.commit_index_, args.LeaderCommit_)
 		tester.Annotate(fmt.Sprintf("server%v", rf.me), "commit advanced", fmt.Sprintf("role=%v term=%v from=%v to=%v", rf.roleName(), rf.current_term_, old_commit, rf.commit_index_))
+
 	}
 
 	//rf.persist()
 	rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, len(rf.logs_)-1, rf.commit_index_)
-	reply.Success_ = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReplys) {
@@ -523,11 +546,46 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	if !reply.Success_ {
 		// follower is outdated, try to update
-		// check to avoid double operation
-		if rf.next_index_[server] > args.PreviousLogIndex_ {
-			rf.debugf("AppendEntries failed for %v, backing up next_index", server)
-			rf.next_index_[server]--
+		// check to avoid stale reply
+		if rf.match_index_[server] >= args.PreviousLogIndex_ {
+			return
 		}
+
+		var new_next_index uint64 = 0
+		if reply.LogLenth_ <= int(args.PreviousLogIndex_) {
+			new_next_index = uint64(reply.LogLenth_)
+		} else if reply.ConflictEntryTerm_ > args.PreviousLogTerm_ {
+			// i don't have it's term in previous log
+			// need to delete it's whole log of conflict term
+			new_next_index = reply.FirstIndexOfConflictEntryTerm_
+		} else {
+			// i have been through it's term in previous log
+			// try to find it
+			start_index := args.PreviousLogIndex_
+			for ; rf.logs_[start_index].Term_ != reply.ConflictEntryTerm_ &&
+				start_index > 0; start_index-- {
+			}
+
+			if start_index == 0 {
+				// i don't have it's term
+				new_next_index = reply.FirstIndexOfConflictEntryTerm_
+			} else {
+				// i have it's term
+				// now it's our common history
+				new_next_index = start_index + 1
+			}
+		}
+
+		if rf.match_index_[server] >= new_next_index {
+			// stale reply
+			return
+		}
+
+		rf.next_index_[server] = new_next_index
+		rf.debugf("AppendEntries failed for %v, backing up next_index", server)
+
+		// immediately proceed
+		rf.sendAppendEntriesHelper(server)
 		return
 	}
 
@@ -537,11 +595,33 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if new_match > rf.match_index_[server] {
 		rf.match_index_[server] = new_match
 		rf.next_index_[server] = rf.match_index_[server] + 1
-	}
-	if logs_length > 0 {
 		rf.debugf("AppendEntries success for %v, updated match_index to %v", server, rf.match_index_[server])
-		go rf.commit()
 	}
+	go rf.commit()
+}
+
+// start a goroutine to send AppendEntries to server
+func (rf *Raft) sendAppendEntriesHelper(server int) {
+	previous_log_index := rf.next_index_[server] - 1
+	previous_log_term := rf.logs_[previous_log_index].Term_
+	entries := make([]LogEntry, 0)
+	if rf.next_index_[server] == rf.match_index_[server]+1 {
+		// found our common history
+		entries = slices.Clone(rf.logs_[previous_log_index+1:])
+	}
+	rf.debugf("Start() sending %v entries to peer %v (prevIdx=%v prevTerm=%v)", len(entries), server, previous_log_index, previous_log_term)
+	args := AppendEntriesArgs{
+		Term_:             rf.current_term_,
+		LeaderID_:         rf.me,
+		PreviousLogIndex_: previous_log_index,
+		PreviousLogTerm_:  previous_log_term,
+		Entries_:          entries,
+		LeaderCommit_:     rf.commit_index_,
+	}
+	go func() {
+		reply := AppendEntriesReplys{}
+		rf.sendAppendEntries(server, &args, &reply)
+	}()
 }
 
 // sync all log entries to followers
@@ -560,26 +640,7 @@ func (rf *Raft) entriesSender() {
 			if peer_index == rf.me {
 				continue
 			}
-			previous_log_index := rf.next_index_[peer_index] - 1
-			previous_log_term := rf.logs_[previous_log_index].Term_
-			entries := make([]LogEntry, 0)
-			if rf.next_index_[peer_index] == rf.match_index_[peer_index]+1 {
-				// found our common history
-				entries = slices.Clone(rf.logs_[previous_log_index+1:])
-			}
-			rf.debugf("Start() sending %v entries to peer %v (prevIdx=%v prevTerm=%v)", len(entries), peer_index, previous_log_index, previous_log_term)
-			args := AppendEntriesArgs{
-				Term_:             rf.current_term_,
-				LeaderID_:         rf.me,
-				PreviousLogIndex_: previous_log_index,
-				PreviousLogTerm_:  previous_log_term,
-				Entries_:          entries,
-				LeaderCommit_:     rf.commit_index_,
-			}
-			go func() {
-				reply := AppendEntriesReplys{}
-				rf.sendAppendEntries(peer_index, &args, &reply)
-			}()
+			rf.sendAppendEntriesHelper(peer_index)
 		}
 	}
 }
@@ -645,7 +706,8 @@ func (rf *Raft) startElection(election_done chan bool) {
 					tester.Annotate(fmt.Sprintf("server%v", rf.me), "became leader", fmt.Sprintf("role=%v term=%v votes=%v/%v", rf.roleName(), args.Term_, vote_count, len(rf.peers)))
 					rf.role_ = Leader
 					for i := range rf.next_index_ {
-						rf.next_index_[i] = rf.commit_index_ + 1
+						rf.next_index_[i] = uint64(len(rf.logs_))
+						//rf.next_index_[i] = rf.commit_index_ + 1
 						rf.match_index_[i] = 0
 					}
 
