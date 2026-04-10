@@ -297,7 +297,25 @@ func (rf *Raft) PersistBytes() int {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	logical_index := LogicalIndex(index)
+	if logical_index > rf.last_applied_ ||
+		logical_index <= rf.last_included_index_ {
+		// invalid index
+		return
+	}
+
+	rf.snapshot_ = snapshot
+	rf.logs_ = rf.getLogSliceCopy(logical_index, rf.getLogLength())
+	old_last_included := rf.last_included_index_
+	rf.last_included_index_ = logical_index
+	rf.last_included_term_ = rf.getLogEntry(logical_index).Term_
+	rf.persist()
+
+	rf.debugf("snapshot: trimmed log from %v to %v, new logLen=%v", old_last_included, rf.last_included_index_, rf.getLogLength())
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "snapshot", fmt.Sprintf("role=%v term=%v lastIncludedIndex=%v lastIncludedTerm=%v logLen=%v", rf.roleName(), rf.current_term_, rf.last_included_index_, rf.last_included_term_, rf.getLogLength()))
 }
 
 // example RequestVote RPC arguments structure.
@@ -306,7 +324,7 @@ type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
 	Term_         uint64
 	Candidate_ID_ int
-	LastLogIndex_ uint64
+	LastLogIndex_ LogicalIndex
 	LastLogTerm_  uint64
 }
 
@@ -381,7 +399,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted_ = false
 		return
 	}
-	if args.LastLogIndex_ >= uint64(rf.getLogLength()-1) {
+	if args.LastLogIndex_ >= rf.getLogLength()-1 {
 		// i have not voted and candidate is qualified, i can vote for it
 		rf.debugf("granting RequestVote to %v for term %v", args.Candidate_ID_, args.Term_)
 		rf.voted_for_ = args.Candidate_ID_
@@ -718,9 +736,8 @@ func (rf *Raft) startElection(election_done chan bool) {
 
 	args.Term_ = rf.current_term_
 	args.Candidate_ID_ = rf.me
-	lastLogIndex := rf.getLogLength() - 1
-	args.LastLogIndex_ = uint64(lastLogIndex)
-	args.LastLogTerm_ = rf.getLogEntry(lastLogIndex).Term_
+	args.LastLogIndex_ = rf.getLogLength() - 1
+	args.LastLogTerm_ = rf.getLogEntry(args.LastLogIndex_).Term_
 
 	rf.mu.Unlock()
 	vote_count := 1
