@@ -24,6 +24,7 @@ import (
 )
 
 type RoleType int
+type LogicalIndex uint64
 
 const (
 	Follower RoleType = iota
@@ -55,17 +56,20 @@ type Raft struct {
 	role_ RoleType
 
 	// persistent state on all servers
-	current_term_ uint64
-	voted_for_    int // index of the peer into peers[] which this peer voted for
-	logs_         []LogEntry
+	current_term_        uint64
+	voted_for_           int // index of the peer into peers[] which this peer voted for
+	logs_                []LogEntry
+	last_included_index_ LogicalIndex
+	last_included_term_  uint64
+	snapshot_            []byte
 
 	// volatile state on all servers
-	commit_index_ uint64
-	last_applied_ uint64
+	commit_index_ LogicalIndex
+	last_applied_ LogicalIndex
 
 	// volatile state on leaders
-	next_index_  []uint64
-	match_index_ []uint64
+	next_index_  []LogicalIndex
+	match_index_ []LogicalIndex
 
 	last_heartbeat_time_   time.Time
 	apply_message_channel_ chan raftapi.ApplyMsg
@@ -84,6 +88,26 @@ func (rf *Raft) roleName() string {
 	default:
 		return "Unknown"
 	}
+}
+
+func (rf *Raft) logicalIndexToPhysicalIndex(index LogicalIndex) uint64 {
+	return uint64(index - rf.last_included_index_)
+}
+
+func (rf *Raft) getLogEntry(index LogicalIndex) *LogEntry {
+	return &rf.logs_[rf.logicalIndexToPhysicalIndex(index)]
+}
+
+func (rf *Raft) getLogSlice(begin, end LogicalIndex) []LogEntry {
+	return rf.logs_[rf.logicalIndexToPhysicalIndex(begin):rf.logicalIndexToPhysicalIndex(end)]
+}
+
+func (rf *Raft) getLogSliceCopy(begin, end LogicalIndex) []LogEntry {
+	return slices.Clone(rf.getLogSlice(begin, end))
+}
+
+func (rf *Raft) getLogLength() LogicalIndex {
+	return rf.last_included_index_ + LogicalIndex(len(rf.logs_))
 }
 
 func (rf *Raft) debugf(format string, args ...interface{}) {
@@ -111,7 +135,7 @@ func (rf *Raft) applier() {
 			rf.apply_cond_.Wait()
 		}
 		start := rf.last_applied_ + 1
-		entries := slices.Clone(rf.logs_[start : rf.commit_index_+1])
+		entries := rf.getLogSliceCopy(start, rf.commit_index_+1)
 		rf.last_applied_ = rf.commit_index_
 		rf.mu.Unlock()
 		for offset, entry := range entries {
@@ -142,8 +166,8 @@ func (rf *Raft) commit() {
 
 	// build a sorted copy of match indices; treat self as fully matched
 	matched := slices.Clone(rf.match_index_)
-	matched[rf.me] = uint64(len(rf.logs_) - 1)
-	slices.SortFunc(matched, func(a, b uint64) int {
+	matched[rf.me] = rf.getLogLength() - 1
+	slices.SortFunc(matched, func(a, b LogicalIndex) int {
 		if a > b {
 			return -1
 		} else if a < b {
@@ -156,7 +180,7 @@ func (rf *Raft) commit() {
 	// for N=3: sorted[1] => at least 2 servers have it; for N=5: sorted[2] => at least 3 servers have it
 	majority_index := matched[len(rf.peers)/2]
 
-	if majority_index > rf.commit_index_ && rf.logs_[majority_index].Term_ == rf.current_term_ {
+	if majority_index > rf.commit_index_ && rf.getLogEntry(majority_index).Term_ == rf.current_term_ {
 		old_commit := rf.commit_index_
 		rf.commit_index_ = majority_index
 		rf.apply_cond_.Signal()
@@ -203,11 +227,13 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.current_term_)
 	encoder.Encode(rf.voted_for_)
 	encoder.Encode(rf.logs_)
+	encoder.Encode(rf.last_included_index_)
+	encoder.Encode(rf.last_included_term_)
 
 	raft_state := buffer.Bytes()
-	rf.persister.Save(raft_state, nil)
-	rf.debugf("persisted state: term=%v votedFor=%v logLen=%v", rf.current_term_, rf.voted_for_, len(rf.logs_))
-	tester.Annotate(fmt.Sprintf("server%v", rf.me), "persisted", fmt.Sprintf("term=%v votedFor=%v logLen=%v", rf.current_term_, rf.voted_for_, len(rf.logs_)))
+	rf.persister.Save(raft_state, rf.snapshot_)
+	rf.debugf("persisted state: term=%v votedFor=%v logLen=%v", rf.current_term_, rf.voted_for_, rf.getLogLength())
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "persisted", fmt.Sprintf("term=%v votedFor=%v logLen=%v", rf.current_term_, rf.voted_for_, rf.getLogLength()))
 }
 
 // restore previously persisted state.
@@ -235,10 +261,14 @@ func (rf *Raft) readPersist(data []byte) {
 	var current_term uint64
 	var voted_for int
 	logs := make([]LogEntry, 0)
+	var last_included_index LogicalIndex
+	var last_included_term uint64
 
 	if decoder.Decode(&current_term) != nil ||
 		decoder.Decode(&voted_for) != nil ||
-		decoder.Decode(&logs) != nil {
+		decoder.Decode(&logs) != nil ||
+		decoder.Decode(&last_included_index) != nil ||
+		decoder.Decode(&last_included_term) != nil {
 		// error
 		return
 	}
@@ -246,8 +276,12 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.current_term_ = current_term
 	rf.voted_for_ = voted_for
 	rf.logs_ = logs
-	rf.debugf("restored persisted state: term=%v votedFor=%v logLen=%v", rf.current_term_, rf.voted_for_, len(rf.logs_))
-	tester.Annotate(fmt.Sprintf("server%v", rf.me), "restored", fmt.Sprintf("term=%v votedFor=%v logLen=%v", rf.current_term_, rf.voted_for_, len(rf.logs_)))
+	rf.last_included_index_ = last_included_index
+	rf.last_included_term_ = last_included_term
+	rf.snapshot_ = rf.persister.ReadSnapshot()
+
+	rf.debugf("restored persisted state: term=%v votedFor=%v logLen=%v", rf.current_term_, rf.voted_for_, rf.getLogLength())
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "restored", fmt.Sprintf("term=%v votedFor=%v logLen=%v", rf.current_term_, rf.voted_for_, rf.getLogLength()))
 }
 
 // how many bytes in Raft's persisted log?
@@ -328,10 +362,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted_ = false
 		return
 	}
-	if args.LastLogTerm_ > rf.logs_[len(rf.logs_)-1].Term_ {
+	if args.LastLogTerm_ > rf.getLogEntry(rf.getLogLength()-1).Term_ {
 		// candidate's log is ahead, grant vote
-		rf.debugf("granting RequestVote to %v (candidate last log term %v > my last log term %v)", args.Candidate_ID_, args.LastLogTerm_, rf.logs_[len(rf.logs_)-1].Term_)
-		tester.Annotate(fmt.Sprintf("server%v", rf.me), "vote granted(candidate log ahead)", fmt.Sprintf("role=%v term=%v candidate=%v candidateLastLogTerm=%v myLastLogTerm=%v", rf.roleName(), rf.current_term_, args.Candidate_ID_, args.LastLogTerm_, rf.logs_[len(rf.logs_)-1].Term_))
+		rf.debugf("granting RequestVote to %v (candidate last log term %v > my last log term %v)", args.Candidate_ID_, args.LastLogTerm_, rf.getLogEntry(rf.getLogLength()-1).Term_)
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "vote granted(candidate log ahead)", fmt.Sprintf("role=%v term=%v candidate=%v candidateLastLogTerm=%v myLastLogTerm=%v", rf.roleName(), rf.current_term_, args.Candidate_ID_, args.LastLogTerm_, rf.getLogEntry(rf.getLogLength()-1).Term_))
 		rf.voted_for_ = args.Candidate_ID_
 		rf.last_heartbeat_time_ = time.Now()
 		rf.persist()
@@ -339,15 +373,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted_ = true
 		return
 	}
-	if args.LastLogTerm_ < rf.logs_[len(rf.logs_)-1].Term_ {
+	if args.LastLogTerm_ < rf.getLogEntry(rf.getLogLength()-1).Term_ {
 		// candidate's log is behind
-		rf.debugf("rejecting RequestVote from %v (candidate last log term %v < my last log term %v)", args.Candidate_ID_, args.LastLogTerm_, rf.logs_[len(rf.logs_)-1].Term_)
-		tester.Annotate(fmt.Sprintf("server%v", rf.me), "vote rejected(log behind)", fmt.Sprintf("role=%v term=%v candidate=%v candidateLastLogTerm=%v myLastLogTerm=%v", rf.roleName(), rf.current_term_, args.Candidate_ID_, args.LastLogTerm_, rf.logs_[len(rf.logs_)-1].Term_))
+		rf.debugf("rejecting RequestVote from %v (candidate last log term %v < my last log term %v)", args.Candidate_ID_, args.LastLogTerm_, rf.getLogEntry(rf.getLogLength()-1).Term_)
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "vote rejected(log behind)", fmt.Sprintf("role=%v term=%v candidate=%v candidateLastLogTerm=%v myLastLogTerm=%v", rf.roleName(), rf.current_term_, args.Candidate_ID_, args.LastLogTerm_, rf.getLogEntry(rf.getLogLength()-1).Term_))
 		reply.Term_ = rf.current_term_
 		reply.VoteGranted_ = false
 		return
 	}
-	if args.LastLogIndex_ >= uint64(len(rf.logs_)-1) {
+	if args.LastLogIndex_ >= uint64(rf.getLogLength()-1) {
 		// i have not voted and candidate is qualified, i can vote for it
 		rf.debugf("granting RequestVote to %v for term %v", args.Candidate_ID_, args.Term_)
 		rf.voted_for_ = args.Candidate_ID_
@@ -403,18 +437,18 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 type AppendEntriesArgs struct {
 	Term_             uint64
 	LeaderID_         int
-	PreviousLogIndex_ uint64
+	PreviousLogIndex_ LogicalIndex
 	PreviousLogTerm_  uint64
 	Entries_          []LogEntry
-	LeaderCommit_     uint64
+	LeaderCommit_     LogicalIndex
 }
 
 type AppendEntriesReplys struct {
 	Term_                          uint64
 	Success_                       bool
 	ConflictEntryTerm_             uint64
-	FirstIndexOfConflictEntryTerm_ uint64
-	LogLenth_                      int
+	FirstIndexOfConflictEntryTerm_ LogicalIndex
+	LogLenth_                      LogicalIndex
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReplys) {
@@ -441,24 +475,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.last_heartbeat_time_ = time.Now()
 	rf.role_ = Follower
 
-	if uint64(len(rf.logs_)) <= args.PreviousLogIndex_ {
+	if rf.getLogLength() <= args.PreviousLogIndex_ {
 		// my log is short
 		rf.debugf("rejecting AppendEntries from %v (my log is short)", args.LeaderID_)
 		reply.Success_ = false
-		reply.LogLenth_ = len(rf.logs_)
+		reply.LogLenth_ = rf.getLogLength()
 		return
 	}
 
-	if conflict_term := rf.logs_[args.PreviousLogIndex_].Term_; conflict_term != args.PreviousLogTerm_ {
+	if conflict_term := rf.getLogEntry(args.PreviousLogIndex_).Term_; conflict_term != args.PreviousLogTerm_ {
 		// previous log is wrong
 		rf.debugf("rejecting AppendEntries from %v (prev log wrong)", args.LeaderID_)
 		first_conflict_index := args.PreviousLogIndex_
 		for ; first_conflict_index > 0 &&
-			rf.logs_[first_conflict_index-1].Term_ == conflict_term; first_conflict_index-- {
+			rf.getLogEntry(first_conflict_index-1).Term_ == conflict_term; first_conflict_index-- {
 		}
 
 		reply.Success_ = false
-		reply.LogLenth_ = len(rf.logs_)
+		reply.LogLenth_ = rf.getLogLength()
 		reply.ConflictEntryTerm_ = conflict_term
 		reply.FirstIndexOfConflictEntryTerm_ = first_conflict_index
 		return
@@ -469,8 +503,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success_ = true
 	is_logs_modified := false
 	for relative_index, leader_log_entry := range args.Entries_ {
-		index := args.PreviousLogIndex_ + 1 + uint64(relative_index)
-		if index == uint64(len(rf.logs_)) {
+		index := args.PreviousLogIndex_ + 1 + LogicalIndex(relative_index)
+		if index == rf.getLogLength() {
 			// append new entry
 			rf.logs_ = append(rf.logs_, leader_log_entry)
 			is_logs_modified = true
@@ -478,13 +512,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			continue
 		}
 
-		curr_log_entry := &rf.logs_[index]
+		curr_log_entry := rf.getLogEntry(index)
 		if curr_log_entry.Term_ != leader_log_entry.Term_ {
 			// conflict: truncate and overwrite
 			rf.debugf("conflict at idx=%v (have term=%v want term=%v), truncating log", index, curr_log_entry.Term_, leader_log_entry.Term_)
 			curr_log_entry.Term_ = leader_log_entry.Term_
 			curr_log_entry.Command_ = leader_log_entry.Command_
-			rf.logs_ = rf.logs_[:index+1]
+			rf.logs_ = rf.getLogSlice(rf.last_included_index_, index+1)
 			is_logs_modified = true
 		}
 
@@ -497,17 +531,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// avoid out of range of rf.logs
-	new_commit_index := min(args.LeaderCommit_, uint64(len(rf.logs_))-1)
+	new_commit_index := min(args.LeaderCommit_, rf.getLogLength()-1)
 	// avoid out of range of correct log
 	// only args.entries covered is correct
-	new_commit_index = min(new_commit_index, args.PreviousLogIndex_+uint64(len(args.Entries_)))
+	new_commit_index = min(new_commit_index, args.PreviousLogIndex_+LogicalIndex(len(args.Entries_)))
 
 	if new_commit_index > rf.commit_index_ {
 		old_commit := rf.commit_index_
 		// catch up leader's commit index
 		rf.commit_index_ = new_commit_index
 		rf.persist()
-		rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, len(rf.logs_)-1, rf.commit_index_)
+		rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, rf.getLogLength()-1, rf.commit_index_)
 		rf.apply_cond_.Signal()
 
 		rf.debugf("commit_index advanced from %v to %v (leaderCommit=%v)", old_commit, rf.commit_index_, args.LeaderCommit_)
@@ -516,7 +550,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	//rf.persist()
-	rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, len(rf.logs_)-1, rf.commit_index_)
+	rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, rf.getLogLength()-1, rf.commit_index_)
+}
+
+type InstallSnapshotArgs struct {
+	Term_              uint64
+	LeaderID_          int
+	LastIncludedIndex_ LogicalIndex
+	LastIncludedTerm_  uint64
+	Data_              []byte
+}
+
+type InstallSnapshotReplys struct {
+	Term_ uint64
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReplys) {
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReplys) {
@@ -552,9 +601,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			return
 		}
 
-		var new_next_index uint64 = 0
-		if reply.LogLenth_ <= int(args.PreviousLogIndex_) {
-			new_next_index = uint64(reply.LogLenth_)
+		var new_next_index LogicalIndex = 0
+		if reply.LogLenth_ <= args.PreviousLogIndex_ {
+			new_next_index = reply.LogLenth_
 		} else if reply.ConflictEntryTerm_ > args.PreviousLogTerm_ {
 			// i don't have it's term in previous log
 			// need to delete it's whole log of conflict term
@@ -563,7 +612,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			// i have been through it's term in previous log
 			// try to find it
 			start_index := args.PreviousLogIndex_
-			for ; rf.logs_[start_index].Term_ != reply.ConflictEntryTerm_ &&
+			for ; rf.getLogEntry(start_index).Term_ != reply.ConflictEntryTerm_ &&
 				start_index > 0; start_index-- {
 			}
 
@@ -592,7 +641,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	// follower reply success
 	logs_length := len(args.Entries_)
-	new_match := args.PreviousLogIndex_ + uint64(logs_length)
+	new_match := args.PreviousLogIndex_ + LogicalIndex(logs_length)
 	if new_match > rf.match_index_[server] {
 		rf.match_index_[server] = new_match
 		rf.next_index_[server] = rf.match_index_[server] + 1
@@ -604,11 +653,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // start a goroutine to send AppendEntries to server
 func (rf *Raft) sendAppendEntriesHelper(server int) {
 	previous_log_index := rf.next_index_[server] - 1
-	previous_log_term := rf.logs_[previous_log_index].Term_
+	previous_log_term := rf.getLogEntry(previous_log_index).Term_
 	entries := make([]LogEntry, 0)
 	if rf.next_index_[server] == rf.match_index_[server]+1 {
 		// found our common history
-		entries = slices.Clone(rf.logs_[previous_log_index+1:])
+		entries = rf.getLogSliceCopy(previous_log_index+1, rf.getLogLength())
 	}
 	rf.debugf("Start() sending %v entries to peer %v (prevIdx=%v prevTerm=%v)", len(entries), server, previous_log_index, previous_log_term)
 	args := AppendEntriesArgs{
@@ -669,8 +718,9 @@ func (rf *Raft) startElection(election_done chan bool) {
 
 	args.Term_ = rf.current_term_
 	args.Candidate_ID_ = rf.me
-	args.LastLogIndex_ = uint64(len(rf.logs_)) - 1
-	args.LastLogTerm_ = rf.logs_[args.LastLogIndex_].Term_
+	lastLogIndex := rf.getLogLength() - 1
+	args.LastLogIndex_ = uint64(lastLogIndex)
+	args.LastLogTerm_ = rf.getLogEntry(lastLogIndex).Term_
 
 	rf.mu.Unlock()
 	vote_count := 1
@@ -719,7 +769,7 @@ func (rf *Raft) startElection(election_done chan bool) {
 					tester.Annotate(fmt.Sprintf("server%v", rf.me), "became leader", fmt.Sprintf("role=%v term=%v votes=%v/%v", rf.roleName(), args.Term_, vote_count, len(rf.peers)))
 					rf.role_ = Leader
 					for i := range rf.next_index_ {
-						rf.next_index_[i] = uint64(len(rf.logs_))
+						rf.next_index_[i] = rf.getLogLength()
 						//rf.next_index_[i] = rf.commit_index_ + 1
 						rf.match_index_[i] = 0
 					}
@@ -770,10 +820,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// i am a leader, append log entry
 	rf.logs_ = append(rf.logs_, LogEntry{Command_: command, Term_: rf.current_term_})
-	index = len(rf.logs_) - 1
+	index = int(rf.getLogLength()) - 1
 	term = int(rf.current_term_)
 	rf.persist()
-	rf.debugf("Start() appended cmd=%v at idx=%v term=%v, log len=%v", command, index, term, len(rf.logs_)-1)
+	rf.debugf("Start() appended cmd=%v at idx=%v term=%v, log len=%v", command, index, term, rf.getLogLength()-1)
 	tester.Annotate(fmt.Sprintf("server%v", rf.me), "cmd appended", fmt.Sprintf("role=%v term=%v idx=%v cmd=%v", rf.roleName(), rf.current_term_, index, command))
 
 	rf.send_entries_cond_.Signal()
@@ -865,14 +915,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.current_term_ = 0
 	rf.voted_for_ = -1
 	rf.logs_ = make([]LogEntry, 1)
+	rf.last_included_index_ = 0
+	rf.last_included_term_ = 0
 
 	rf.commit_index_ = 0
 	rf.last_applied_ = 0
 	rf.apply_cond_ = sync.NewCond(&rf.mu)
 	rf.send_entries_cond_ = sync.NewCond(&rf.mu)
 
-	rf.next_index_ = make([]uint64, len(rf.peers))
-	rf.match_index_ = make([]uint64, len(rf.peers))
+	rf.next_index_ = make([]LogicalIndex, len(rf.peers))
+	rf.match_index_ = make([]LogicalIndex, len(rf.peers))
 	for i := range rf.next_index_ {
 		rf.next_index_[i] = rf.commit_index_ + 1
 		rf.match_index_[i] = 0
