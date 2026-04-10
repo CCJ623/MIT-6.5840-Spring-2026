@@ -37,8 +37,8 @@ type LogEntry struct {
 }
 
 const HEARTBEAT_INTERVAL = 100 * time.Millisecond
-const ELECTION_TIMEOUT = 500 * time.Millisecond
-const RANDOM_SLEEP_MIN = 150 * time.Millisecond
+const ELECTION_TIMEOUT = 400 * time.Millisecond
+const RANDOM_SLEEP_MIN = 0 * time.Millisecond
 const RANDOM_SLEEP_MAX = 300 * time.Millisecond
 const DEBUG = false
 
@@ -453,7 +453,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// previous log is wrong
 		rf.debugf("rejecting AppendEntries from %v (prev log wrong)", args.LeaderID_)
 		first_conflict_index := args.PreviousLogIndex_
-		for ; rf.logs_[first_conflict_index].Term_ != conflict_term; first_conflict_index-- {
+		for ; first_conflict_index > 0 &&
+			rf.logs_[first_conflict_index-1].Term_ == conflict_term; first_conflict_index-- {
 		}
 
 		reply.Success_ = false
@@ -529,11 +530,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.role_ != Leader {
-		// role not match
-		return
-	}
-	if rf.current_term_ < reply.Term_ {
+	if reply.Term_ > rf.current_term_ {
 		// i am outdated
 		rf.debugf("AppendEntries reply contained higher term %v, stepping down", reply.Term_)
 		tester.Annotate(fmt.Sprintf("server%v", rf.me), "stepped down(AppendEntries)", fmt.Sprintf("role=%v term=%v->%v from peer=%v", rf.roleName(), rf.current_term_, reply.Term_, server))
@@ -541,6 +538,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		rf.current_term_ = reply.Term_
 		rf.voted_for_ = -1
 		rf.persist()
+		return
+	}
+	if rf.role_ != Leader || rf.current_term_ != args.Term_ {
+		// stale reply
 		return
 	}
 
@@ -690,6 +691,18 @@ func (rf *Raft) startElection(election_done chan bool) {
 
 			rf.mu.Lock()
 
+			if reply.Term_ > rf.current_term_ {
+				// i am a loser
+				rf.debugf("stepped down to Follower (reply term %v > current %v)", reply.Term_, rf.current_term_)
+				tester.Annotate(fmt.Sprintf("server%v", rf.me), "stepped down(Election)", fmt.Sprintf("role=%v term=%v->%v during election", rf.roleName(), rf.current_term_, reply.Term_))
+				rf.current_term_ = reply.Term_
+				rf.role_ = Follower
+				rf.voted_for_ = -1
+				rf.persist()
+				rf.mu.Unlock()
+				election_done <- true
+				return
+			}
 			if rf.role_ != Candidate || rf.current_term_ != args.Term_ {
 				// state is outdated
 				rf.mu.Unlock()
@@ -717,25 +730,6 @@ func (rf *Raft) startElection(election_done chan bool) {
 					return
 				}
 				rf.mu.Unlock()
-				return
-			}
-			if reply.Term_ > rf.current_term_ {
-				// i am a loser
-				rf.debugf("stepped down to Follower (reply term %v > current %v)", reply.Term_, rf.current_term_)
-				tester.Annotate(fmt.Sprintf("server%v", rf.me), "stepped down(Election)", fmt.Sprintf("role=%v term=%v->%v during election", rf.roleName(), rf.current_term_, reply.Term_))
-				rf.current_term_ = reply.Term_
-				rf.role_ = Follower
-				rf.voted_for_ = -1
-				rf.persist()
-
-				for index := range rf.next_index_ {
-					rf.next_index_[index] = uint64(len(rf.logs_))
-				}
-				for index := range rf.match_index_ {
-					rf.match_index_[index] = 0
-				}
-				rf.mu.Unlock()
-				election_done <- true
 				return
 			}
 			rf.mu.Unlock()
