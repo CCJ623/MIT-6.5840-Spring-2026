@@ -131,9 +131,33 @@ func (rf *Raft) applier() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	for {
-		for rf.last_applied_ >= rf.commit_index_ {
+		for rf.last_applied_ == rf.commit_index_ {
+			// keep waiting if nothing to commit
 			rf.apply_cond_.Wait()
 		}
+
+		// A snapshot was installed that covers entries we haven't delivered yet.
+		// Deliver a SnapshotValid message so the service can update its state.
+		if rf.last_applied_ < rf.last_included_index_ {
+			snapshot := rf.snapshot_
+			snapIndex := rf.last_included_index_
+			snapTerm := rf.last_included_term_
+			rf.last_applied_ = rf.last_included_index_
+			rf.mu.Unlock()
+			rf.debugf("applier: delivering snapshot index=%v term=%v", snapIndex, snapTerm)
+			rf.apply_message_channel_ <- raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      snapshot,
+				SnapshotIndex: int(snapIndex),
+				SnapshotTerm:  int(snapTerm),
+			}
+			rf.mu.Lock()
+		}
+
+		if rf.last_applied_ == rf.commit_index_ {
+			continue
+		}
+
 		start := rf.last_applied_ + 1
 		entries := rf.getLogSliceCopy(start, rf.commit_index_+1)
 		rf.last_applied_ = rf.commit_index_
@@ -156,6 +180,7 @@ func (rf *Raft) applier() {
 	}
 }
 
+// only called by leader
 func (rf *Raft) commit() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -553,22 +578,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// avoid out of range of correct log
 	// only args.entries covered is correct
 	new_commit_index = min(new_commit_index, args.PreviousLogIndex_+LogicalIndex(len(args.Entries_)))
-
-	if new_commit_index > rf.commit_index_ {
-		old_commit := rf.commit_index_
-		// catch up leader's commit index
-		rf.commit_index_ = new_commit_index
-		rf.persist()
-		rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, rf.getLogLength()-1, rf.commit_index_)
-		rf.apply_cond_.Signal()
-
-		rf.debugf("commit_index advanced from %v to %v (leaderCommit=%v)", old_commit, rf.commit_index_, args.LeaderCommit_)
-		tester.Annotate(fmt.Sprintf("server%v", rf.me), "commit advanced", fmt.Sprintf("role=%v term=%v from=%v to=%v", rf.roleName(), rf.current_term_, old_commit, rf.commit_index_))
-
+	if new_commit_index <= rf.commit_index_ {
+		// nothing to commit
+		return
 	}
 
-	//rf.persist()
+	old_commit := rf.commit_index_
+	// catch up leader's commit index
+	rf.commit_index_ = new_commit_index
+	rf.persist()
 	rf.debugf("accepted AppendEntries from %v: log len now=%v commit_index=%v", args.LeaderID_, rf.getLogLength()-1, rf.commit_index_)
+	rf.apply_cond_.Signal()
+
+	rf.debugf("commit_index advanced from %v to %v (leaderCommit=%v)", old_commit, rf.commit_index_, args.LeaderCommit_)
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "commit advanced", fmt.Sprintf("role=%v term=%v from=%v to=%v", rf.roleName(), rf.current_term_, old_commit, rf.commit_index_))
 }
 
 type InstallSnapshotArgs struct {
@@ -584,6 +607,88 @@ type InstallSnapshotReplys struct {
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReplys) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.debugf("received InstallSnapshot from %v: term=%v lastIncludedIndex=%v lastIncludedTerm=%v",
+		args.LeaderID_, args.Term_, args.LastIncludedIndex_, args.LastIncludedTerm_)
+
+	reply.Term_ = rf.current_term_
+	if args.Term_ < rf.current_term_ {
+		// old leader
+		rf.debugf("rejecting InstallSnapshot from %v (term %v < current %v)", args.LeaderID_, args.Term_, rf.current_term_)
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "InstallSnapshot rejected(stale term)", fmt.Sprintf("role=%v term=%v leaderTerm=%v", rf.roleName(), rf.current_term_, args.Term_))
+		return
+	}
+	if args.LastIncludedIndex_ <= rf.last_included_index_ {
+		// stale RPC
+		rf.debugf("rejecting InstallSnapshot from %v (stale: lastIncludedIndex %v <= my %v)", args.LeaderID_, args.LastIncludedIndex_, rf.last_included_index_)
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "InstallSnapshot rejected(stale)", fmt.Sprintf("role=%v term=%v", rf.roleName(), rf.current_term_))
+		return
+	}
+
+	if rf.getLogLength() > args.LastIncludedIndex_ &&
+		rf.getLogEntry(args.LastIncludedIndex_).Term_ == args.LastIncludedTerm_ {
+		// truncate my log
+		rf.logs_ = rf.getLogSliceCopy(args.LastIncludedIndex_, rf.getLogLength())
+	} else {
+		rf.logs_ = make([]LogEntry, 1)
+	}
+
+	rf.snapshot_ = args.Data_
+	rf.last_included_index_ = args.LastIncludedIndex_
+	rf.last_included_term_ = args.LastIncludedTerm_
+	rf.getLogEntry(rf.last_included_index_).Term_ = rf.last_included_term_
+	// make sure commit_index_ >= snapshot
+	rf.commit_index_ = max(rf.commit_index_, args.LastIncludedIndex_)
+	// Do NOT set last_applied_ here; the applier goroutine will deliver
+	// a SnapshotValid ApplyMsg and advance last_applied_ itself.
+	rf.persist()
+
+	rf.debugf("installed snapshot: lastIncludedIndex=%v lastIncludedTerm=%v newLogLen=%v", rf.last_included_index_, rf.last_included_term_, rf.getLogLength())
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "InstallSnapshot accepted", fmt.Sprintf("role=%v term=%v lastIncludedIndex=%v lastIncludedTerm=%v logLen=%v", rf.roleName(), rf.current_term_, rf.last_included_index_, rf.last_included_term_, rf.getLogLength()))
+	rf.apply_cond_.Signal()
+}
+
+func (rf *Raft) sendInstallSnapshot(server int) {
+	rf.mu.Lock()
+	args := &InstallSnapshotArgs{Term_: rf.current_term_,
+		LeaderID_:          rf.me,
+		LastIncludedIndex_: rf.last_included_index_,
+		LastIncludedTerm_:  rf.last_included_term_,
+		Data_:              rf.snapshot_}
+	reply := &InstallSnapshotReplys{}
+	rf.debugf("sending InstallSnapshot to %v: lastIncludedIndex=%v lastIncludedTerm=%v", server, args.LastIncludedIndex_, args.LastIncludedTerm_)
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "sending InstallSnapshot", fmt.Sprintf("role=%v term=%v to=%v lastIncludedIndex=%v", rf.roleName(), rf.current_term_, server, args.LastIncludedIndex_))
+	rf.mu.Unlock()
+
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if !ok {
+		// RPC failed
+		rf.debugf("InstallSnapshot RPC to %v failed", server)
+		return
+	}
+	if reply.Term_ > rf.current_term_ {
+		// i am outdated
+		rf.debugf("stepping down: InstallSnapshot reply from %v has higher term %v", server, reply.Term_)
+		tester.Annotate(fmt.Sprintf("server%v", rf.me), "stepped down(InstallSnapshot)", fmt.Sprintf("role=%v term=%v->%v from peer=%v", rf.roleName(), rf.current_term_, reply.Term_, server))
+		rf.current_term_ = reply.Term_
+		rf.role_ = Follower
+		rf.voted_for_ = -1
+		rf.persist()
+		return
+	}
+
+	// install success
+	rf.debugf("InstallSnapshot to %v succeeded, updating match/next index", server)
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "InstallSnapshot success", fmt.Sprintf("role=%v term=%v to=%v lastIncludedIndex=%v", rf.roleName(), rf.current_term_, server, args.LastIncludedIndex_))
+	rf.match_index_[server] = args.LastIncludedIndex_
+	rf.next_index_[server] = args.LastIncludedIndex_ + 1
+	go rf.commit()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReplys) {
@@ -648,6 +753,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			// stale reply
 			return
 		}
+		if new_next_index <= rf.last_included_index_ {
+			// new_next_index before snapshot, no logs entries any more
+			// install snapshot instead
+			go rf.sendInstallSnapshot(server)
+			rf.debugf("AppendEntries failed for %v, sending snapshot", server)
+			return
+		}
 
 		rf.next_index_[server] = new_next_index
 		rf.debugf("AppendEntries failed for %v, backing up next_index", server)
@@ -669,7 +781,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 // start a goroutine to send AppendEntries to server
+// send probe if i do NOT find follower's common history
+// send log entries if i DO find follower's common history
 func (rf *Raft) sendAppendEntriesHelper(server int) {
+	if rf.next_index_[server] <= rf.last_included_index_ {
+		// next_index is before our snapshot; send snapshot instead
+		rf.debugf("sendAppendEntriesHelper: next_index[%v]=%v <= last_included_index_=%v, sending snapshot", server, rf.next_index_[server], rf.last_included_index_)
+		go rf.sendInstallSnapshot(server)
+		return
+	}
 	previous_log_index := rf.next_index_[server] - 1
 	previous_log_term := rf.getLogEntry(previous_log_index).Term_
 	entries := make([]LogEntry, 0)
@@ -943,7 +1063,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.next_index_ = make([]LogicalIndex, len(rf.peers))
 	rf.match_index_ = make([]LogicalIndex, len(rf.peers))
 	for i := range rf.next_index_ {
-		rf.next_index_[i] = rf.commit_index_ + 1
+		rf.next_index_[i] = rf.getLogLength()
 		rf.match_index_[i] = 0
 	}
 
