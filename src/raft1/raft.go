@@ -526,6 +526,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	if args.PreviousLogIndex_ < rf.last_included_index_ {
+		// try to append entries before snapshot, reject this stale request
+		rf.debugf("rejecting AppendEntries from %v (entries before snapshot)", args.LeaderID_)
+		reply.Success_ = true
+		reply.LogLenth_ = rf.getLogLength()
+		return
+	}
+
 	if conflict_term := rf.getLogEntry(args.PreviousLogIndex_).Term_; conflict_term != args.PreviousLogTerm_ {
 		// previous log is wrong
 		rf.debugf("rejecting AppendEntries from %v (prev log wrong)", args.LeaderID_)
