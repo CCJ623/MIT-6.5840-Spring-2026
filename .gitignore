@@ -6,3 +6,4 @@ mr-intermediate-*
 mr-tmp-*/
 mr-out-*
 /TODO
+.gemini/
