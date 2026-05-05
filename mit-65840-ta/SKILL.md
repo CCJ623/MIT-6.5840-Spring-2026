@@ -47,4 +47,13 @@ Use the `Makefile` in the `src` directory to run tests:
 ## Resources
 
 - [Lab Overview](references/lab-overview.md): Detailed description of each lab's goals and structure.
+- [Resource Map](references/resources-map.md): A map of official lab guides and papers in the `docs` branch.
 - [Test Runner](scripts/run-tests.sh): A script to run tests with common options.
+
+## Documentation Access
+
+Official lab instructions and papers are stored in the `docs` branch. 
+To read them:
+1.  Switch to the branch: `git checkout docs`.
+2.  Navigate to `labs/`, `papers/`, or `course-info/`.
+3.  Switch back to `master` for development.
