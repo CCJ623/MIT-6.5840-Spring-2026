@@ -2,21 +2,24 @@ package rsm
 
 import (
 	"sync"
+	"time"
+
+	"math/rand/v2"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
-	"6.5840/raft1"
+	raft "6.5840/raft1"
 	"6.5840/raftapi"
-	"6.5840/tester1"
-
+	tester "6.5840/tester1"
 )
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Command_ interface{}
+	Id_ uint64
 }
-
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -38,6 +41,32 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+	// key is log index, value is condition
+	operation_channels_ map[int]chan any
+}
+
+func applyReader(rsm *RSM) {
+	for {
+		apply_message := <-rsm.applyCh
+
+		if !apply_message.CommandValid {
+			continue
+		}
+
+		operation := apply_message.Command.(Op)
+		result := rsm.sm.DoOp(operation.Command_)
+
+		rsm.mu.Lock()
+		channel, ok := rsm.operation_channels_[apply_message.CommandIndex]
+		rsm.mu.Unlock()
+
+		// channel not exist
+		if !ok {
+			continue
+		}
+
+		channel <- result
+	}
 }
 
 // servers[] contains the ports of the set of
@@ -57,21 +86,22 @@ type RSM struct {
 // any long-running work.
 func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, maxraftstate int, sm StateMachine) *RSM {
 	rsm := &RSM{
-		me:           me,
-		maxraftstate: maxraftstate,
-		applyCh:      make(chan raftapi.ApplyMsg),
-		sm:           sm,
+		me:                  me,
+		maxraftstate:        maxraftstate,
+		applyCh:             make(chan raftapi.ApplyMsg),
+		sm:                  sm,
+		operation_channels_: make(map[int]chan any, 1),
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	go applyReader(rsm)
 	return rsm
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
-
 
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
@@ -83,5 +113,31 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+	operation := Op{Command_: req, Id_: rand.Uint64()}
+	log_index, term, is_leader := rsm.Raft().Start(operation)
+
+	// not a leader
+	if !is_leader {
+		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	}
+
+	rsm.operation_channels_[log_index] = make(chan any)
+	defer delete(rsm.operation_channels_, log_index)
+	channel := rsm.operation_channels_[log_index]
+
+	// get apply message
+	rsm.mu.Unlock()
+	select {
+	case result := <-channel:
+		rsm.mu.Lock()
+		if current_term, is_still_leader := rsm.Raft().GetState(); current_term != term || !is_still_leader {
+			return rpc.ErrWrongLeader, nil
+		}
+		return rpc.OK, result
+	case <-time.After(2000 * time.Millisecond):
+		rsm.mu.Lock()
+		return rpc.ErrWrongLeader, nil
+	}
 }

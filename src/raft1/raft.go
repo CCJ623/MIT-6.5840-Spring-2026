@@ -165,7 +165,7 @@ func (rf *Raft) applier() {
 		for offset, entry := range entries {
 			index := int(start) + offset
 			rf.mu.Lock()
-			rf.debugf("applying msg: index=%v cmd=%v", index, entry.Command_)
+			rf.debugf("applying msg: index=%v cmd=%#v", index, entry.Command_)
 			rf.mu.Unlock()
 			rf.apply_message_channel_ <- raftapi.ApplyMsg{
 				CommandValid: true,
@@ -173,7 +173,7 @@ func (rf *Raft) applier() {
 				CommandIndex: index,
 			}
 			rf.mu.Lock()
-			rf.debugf("applied msg: index=%v cmd=%v", index, entry.Command_)
+			rf.debugf("applied msg: index=%v cmd=%#v", index, entry.Command_)
 			rf.mu.Unlock()
 		}
 		rf.mu.Lock()
@@ -559,7 +559,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// append new entry
 			rf.logs_ = append(rf.logs_, leader_log_entry)
 			is_logs_modified = true
-			rf.debugf("appended new entry at idx=%v term=%v cmd=%v", index, leader_log_entry.Term_, leader_log_entry.Command_)
+			rf.debugf("appended new entry at idx=%v term=%v cmd=%#v", index, leader_log_entry.Term_, leader_log_entry.Command_)
 			continue
 		}
 
@@ -952,7 +952,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.debugf("Start() called with command %v (role=%v term=%v)", command, rf.roleName(), rf.current_term_)
+	rf.debugf("Start() called with command %#v (role=%v term=%v)", command, rf.roleName(), rf.current_term_)
 
 	if rf.role_ != Leader {
 		// i am not a leader
@@ -968,8 +968,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = int(rf.getLogLength()) - 1
 	term = int(rf.current_term_)
 	rf.persist()
-	rf.debugf("Start() appended cmd=%v at idx=%v term=%v, log len=%v", command, index, term, rf.getLogLength()-1)
-	tester.Annotate(fmt.Sprintf("server%v", rf.me), "cmd appended", fmt.Sprintf("role=%v term=%v idx=%v cmd=%v", rf.roleName(), rf.current_term_, index, command))
+	rf.debugf("Start() appended cmd=%#v at idx=%v term=%v, log len=%v", command, index, term, rf.getLogLength()-1)
+	tester.Annotate(fmt.Sprintf("server%v", rf.me), "cmd appended", fmt.Sprintf("role=%v term=%v idx=%v cmd=%#v", rf.roleName(), rf.current_term_, index, command))
 
 	rf.send_entries_cond_.Signal()
 
