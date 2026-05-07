@@ -2,20 +2,19 @@ package kvraft
 
 import (
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
 )
-
 
 type Clerk struct {
 	clnt    *tester.Clnt
 	servers []string
-	leader int // last successful leader (index into servers[])
+	leader  int // last successful leader (index into servers[])
 	// You can add to this struct.
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
-	ck := &Clerk{clnt: clnt, servers: servers}
+	ck := &Clerk{clnt: clnt, servers: servers, leader: 0}
 	// You'll have to add code here.
 	return ck
 }
@@ -37,7 +36,26 @@ func (ck *Clerk) Leader() int {
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 
 	// You will have to modify this function.
-	return "", 0, ""
+	args := rpc.GetArgs{Key: key}
+	reply := rpc.GetReply{}
+
+	for {
+		ok := ck.clnt.Call(ck.servers[ck.Leader()], "KVServer.Get", &args, &reply)
+
+		// network failed or some error
+		if !ok || reply.Err == rpc.ErrWrongLeader {
+			ck.leader = (ck.Leader() + 1) % len(ck.servers)
+			continue
+		}
+
+		if reply.Err == rpc.ErrNoKey {
+			return reply.Value, reply.Version, rpc.ErrNoKey
+		}
+
+		if reply.Err == rpc.OK {
+			return reply.Value, reply.Version, rpc.OK
+		}
+	}
 }
 
 // Put updates key with value only if the version in the
@@ -59,5 +77,32 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return ""
+	args := rpc.PutArgs{Key: key, Value: value, Version: version}
+	reply := rpc.PutReply{}
+	is_resend_ := false
+
+	for {
+		ok := ck.clnt.Call(ck.servers[ck.Leader()], "KVServer.Put", &args, &reply)
+
+		// network error or wrong leader
+		if !ok || reply.Err == rpc.ErrWrongLeader {
+			ck.leader = (ck.Leader() + 1) % len(ck.servers)
+			is_resend_ = true
+			continue
+		}
+
+		// error version
+		if reply.Err == rpc.ErrVersion && !is_resend_ {
+			return rpc.ErrVersion
+		}
+
+		// unsure
+		if reply.Err == rpc.ErrVersion && is_resend_ {
+			return rpc.ErrMaybe
+		}
+
+		if reply.Err == rpc.OK {
+			return rpc.OK
+		}
+	}
 }
