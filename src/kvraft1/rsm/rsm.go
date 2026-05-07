@@ -18,7 +18,14 @@ type Op struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	Command_ interface{}
-	Id_ uint64
+	Id_      uint64
+}
+
+type OperationResult struct {
+	// op received from raft
+	operation_ Op
+	// result return by DoOp()
+	result_ any
 }
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
@@ -42,7 +49,7 @@ type RSM struct {
 	sm           StateMachine
 	// Your definitions here.
 	// key is log index, value is condition
-	operation_channels_ map[int]chan any
+	operation_channels_ map[int]chan OperationResult
 }
 
 func applyReader(rsm *RSM) {
@@ -65,7 +72,7 @@ func applyReader(rsm *RSM) {
 			continue
 		}
 
-		channel <- result
+		channel <- OperationResult{operation_: operation, result_: result}
 	}
 }
 
@@ -90,7 +97,7 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate:        maxraftstate,
 		applyCh:             make(chan raftapi.ApplyMsg),
 		sm:                  sm,
-		operation_channels_: make(map[int]chan any, 1),
+		operation_channels_: make(map[int]chan OperationResult, 1),
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
@@ -116,26 +123,26 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	rsm.mu.Lock()
 	defer rsm.mu.Unlock()
 	operation := Op{Command_: req, Id_: rand.Uint64()}
-	log_index, term, is_leader := rsm.Raft().Start(operation)
+	log_index, _, is_leader := rsm.Raft().Start(operation)
 
 	// not a leader
 	if !is_leader {
 		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
 	}
 
-	rsm.operation_channels_[log_index] = make(chan any)
+	rsm.operation_channels_[log_index] = make(chan OperationResult, 1)
 	defer delete(rsm.operation_channels_, log_index)
 	channel := rsm.operation_channels_[log_index]
 
 	// get apply message
 	rsm.mu.Unlock()
 	select {
-	case result := <-channel:
+	case operation_result := <-channel:
 		rsm.mu.Lock()
-		if current_term, is_still_leader := rsm.Raft().GetState(); current_term != term || !is_still_leader {
+		if operation_result.operation_.Id_ != operation.Id_ {
 			return rpc.ErrWrongLeader, nil
 		}
-		return rpc.OK, result
+		return rpc.OK, operation_result.result_
 	case <-time.After(2000 * time.Millisecond):
 		rsm.mu.Lock()
 		return rpc.ErrWrongLeader, nil
