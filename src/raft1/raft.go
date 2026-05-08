@@ -91,6 +91,9 @@ func (rf *Raft) roleName() string {
 }
 
 func (rf *Raft) logicalIndexToPhysicalIndex(index LogicalIndex) uint64 {
+	if index < rf.last_included_index_ {
+		panic(fmt.Sprintf("Logic Error: index %v is before snapshot %v", index, rf.last_included_index_))
+	}
 	return uint64(index - rf.last_included_index_)
 }
 
@@ -99,6 +102,9 @@ func (rf *Raft) getLogEntry(index LogicalIndex) *LogEntry {
 }
 
 func (rf *Raft) getLogSlice(begin, end LogicalIndex) []LogEntry {
+	if begin < rf.last_included_index_ || end > rf.getLogLength() {
+		panic(fmt.Sprintf("Logic Error: [begin, end] [%v,%v] is out of range [%v,%v]", begin, end, rf.last_included_index_, rf.getLogLength()))
+	}
 	return rf.logs_[rf.logicalIndexToPhysicalIndex(begin):rf.logicalIndexToPhysicalIndex(end)]
 }
 
@@ -538,7 +544,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// previous log is wrong
 		rf.debugf("rejecting AppendEntries from %v (prev log wrong)", args.LeaderID_)
 		first_conflict_index := args.PreviousLogIndex_
-		for ; first_conflict_index > 0 &&
+		for ; first_conflict_index > rf.last_included_index_+1 &&
 			rf.getLogEntry(first_conflict_index-1).Term_ == conflict_term; first_conflict_index-- {
 		}
 
@@ -743,11 +749,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			// i have been through it's term in previous log
 			// try to find it
 			start_index := args.PreviousLogIndex_
-			for ; rf.getLogEntry(start_index).Term_ != reply.ConflictEntryTerm_ &&
+			for ; start_index > rf.last_included_index_ && rf.getLogEntry(start_index).Term_ != reply.ConflictEntryTerm_ &&
 				start_index > 0; start_index-- {
 			}
 
-			if start_index == 0 {
+			if start_index == rf.last_included_index_ {
 				// i don't have it's term
 				new_next_index = reply.FirstIndexOfConflictEntryTerm_
 			} else {
