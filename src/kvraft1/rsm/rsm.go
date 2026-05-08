@@ -56,23 +56,36 @@ func applyReader(rsm *RSM) {
 	for {
 		apply_message := <-rsm.applyCh
 
-		if !apply_message.CommandValid {
+		// invalid message
+		if !apply_message.CommandValid && !apply_message.SnapshotValid {
 			continue
 		}
 
-		operation := apply_message.Command.(Op)
-		result := rsm.sm.DoOp(operation.Command_)
+		// command
+		if apply_message.CommandValid {
+			operation := apply_message.Command.(Op)
+			result := rsm.sm.DoOp(operation.Command_)
 
-		rsm.mu.Lock()
-		channel, ok := rsm.operation_channels_[apply_message.CommandIndex]
-		rsm.mu.Unlock()
+			// logs to big, do snapshot
+			if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() > rsm.maxraftstate {
+				rsm.rf.Snapshot(apply_message.CommandIndex, rsm.sm.Snapshot())
+			}
 
-		// channel not exist
-		if !ok {
+			rsm.mu.Lock()
+			channel, ok := rsm.operation_channels_[apply_message.CommandIndex]
+			rsm.mu.Unlock()
+
+			// channel not exist
+			if !ok {
+				continue
+			}
+
+			channel <- OperationResult{operation_: operation, result_: result}
 			continue
 		}
 
-		channel <- OperationResult{operation_: operation, result_: result}
+		// snapshot
+		rsm.sm.Restore(apply_message.Snapshot)
 	}
 }
 
@@ -102,6 +115,11 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+
+	if snapshot := persister.ReadSnapshot(); len(snapshot) > 0 {
+		sm.Restore(snapshot)
+	}
+
 	go applyReader(rsm)
 	return rsm
 }
