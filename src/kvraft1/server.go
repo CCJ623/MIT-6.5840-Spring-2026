@@ -31,7 +31,6 @@ type KVServer struct {
 // https://go.dev/tour/methods/16
 // https://go.dev/tour/methods/15
 func (kv *KVServer) DoOp(req any) any {
-	// Your code here
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
@@ -83,7 +82,6 @@ func (kv *KVServer) DoOp(req any) any {
 }
 
 func (kv *KVServer) Snapshot() []byte {
-	// Your code here
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
@@ -98,7 +96,6 @@ func (kv *KVServer) Snapshot() []byte {
 }
 
 func (kv *KVServer) Restore(data []byte) {
-	// Your code here
 	// no data
 	if len(data) < 1 {
 		return
@@ -116,7 +113,6 @@ func (kv *KVServer) Restore(data []byte) {
 	kv.mu.Lock()
 	kv.kv_map_ = new_kv_map
 	kv.mu.Unlock()
-
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {

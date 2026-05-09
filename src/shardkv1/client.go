@@ -9,19 +9,24 @@ package shardkv
 //
 
 import (
+	"sync"
+	"time"
+
+	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp"
 
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
+	kvtest "6.5840/kvtest1"
 	"6.5840/shardkv1/shardctrler"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Clerk struct {
 	clnt *tester.Clnt
 	sck  *shardctrler.ShardCtrler
-	rcks   map[tester.Tgid]*shardgrp.Clerk
+	rcks map[tester.Tgid]*shardgrp.Clerk
 	// You will have to modify this struct.
+	lock sync.Mutex
 }
 
 // The tester calls MakeClerk and passes in a shardctrler so that
@@ -33,6 +38,7 @@ func MakeClerk(clnt *tester.Clnt, sck *shardctrler.ShardCtrler) kvtest.IKVClerk 
 	}
 	ck.rcks = make(map[tester.Tgid]*shardgrp.Clerk)
 	// You'll have to add code here.
+
 	return ck
 }
 
@@ -41,19 +47,58 @@ func (ck *Clerk) GetClerk(gid tester.Tgid) (*shardgrp.Clerk, bool) {
 	return rck, ok
 }
 
-
 // Get a key from a shardgrp.  You can use shardcfg.Key2Shard(key) to
 // find the shard responsible for the key and ck.sck.Query() to read
 // the current configuration and lookup the servers in the group
 // responsible for key.  You can make a clerk for that group by
 // calling shardgrp.MakeClerk(ck.clnt, servers).
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
-	// You will have to modify this function.
-	return "", 0, ""
+	shard_id := shardcfg.Key2Shard(key)
+	for {
+		config := ck.sck.Query()
+		group_id, servers, ok := config.GidServers(shard_id)
+		if !ok || len(servers) < 1 {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		ck.lock.Lock()
+		ck.rcks[group_id] = shardgrp.MakeClerk(ck.clnt, servers)
+		clerk := ck.rcks[group_id]
+		ck.lock.Unlock()
+
+		value, version, err := clerk.Get(key)
+
+		if err == rpc.ErrWrongGroup {
+			continue
+		}
+
+		return value, version, err
+	}
 }
 
 // Put a key to a shard group.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
-	return ""
+	shard_id := shardcfg.Key2Shard(key)
+	for {
+		config := ck.sck.Query()
+		group_id, servers, ok := config.GidServers(shard_id)
+		if !ok || len(servers) < 1 {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		ck.lock.Lock()
+		ck.rcks[group_id] = shardgrp.MakeClerk(ck.clnt, servers)
+		clerk := ck.rcks[group_id]
+		ck.lock.Unlock()
+
+		err := clerk.Put(key, value, version)
+		if err == rpc.ErrWrongGroup {
+			continue
+		}
+
+		return err
+	}
+
 }
