@@ -314,16 +314,21 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 // Freeze the specified shard (i.e., reject future Get/Puts for this
 // shard) and return the key/values stored in that shard.
 func (kv *KVServer) FreezeShard(args *shardrpc.FreezeShardArgs, reply *shardrpc.FreezeShardReply) {
+	kv.mu.Lock()
+	latest_config_num := kv.latest_config_num_for_shards[args.Shard]
+	is_my_shard := kv.is_my_shards[args.Shard]
+	kv.mu.Unlock()
+
 	kv.DPrintf("RPC: FreezeShard(Shard=%d, Num=%d)\n", args.Shard, args.Num)
 
 	// stale RPC
-	if args.Num < kv.latest_config_num_for_shards[args.Shard] {
+	if args.Num < latest_config_num {
 		reply.Err = rpc.ErrWrongGroup
 		return
 	}
 
 	// not my shard
-	if !kv.is_my_shards[args.Shard] {
+	if !is_my_shard {
 		reply.Err = rpc.ErrWrongGroup
 		return
 	}
@@ -341,10 +346,14 @@ func (kv *KVServer) FreezeShard(args *shardrpc.FreezeShardArgs, reply *shardrpc.
 
 // Install the supplied state for the specified shard.
 func (kv *KVServer) InstallShard(args *shardrpc.InstallShardArgs, reply *shardrpc.InstallShardReply) {
+	kv.mu.Lock()
+	latest_config_num := kv.latest_config_num_for_shards[args.Shard]
+	kv.mu.Unlock()
+
 	kv.DPrintf("RPC: InstallShard(Shard=%d, Num=%d)\n", args.Shard, args.Num)
 
 	// stale RPC
-	if args.Num < kv.latest_config_num_for_shards[args.Shard] {
+	if args.Num < latest_config_num {
 		reply.Err = rpc.ErrWrongGroup
 		return
 	}
@@ -363,15 +372,20 @@ func (kv *KVServer) InstallShard(args *shardrpc.InstallShardArgs, reply *shardrp
 
 // Delete the specified shard.
 func (kv *KVServer) DeleteShard(args *shardrpc.DeleteShardArgs, reply *shardrpc.DeleteShardReply) {
+	kv.mu.Lock()
+	latest_config_num := kv.latest_config_num_for_shards[args.Shard]
+	is_my_shard := kv.is_my_shards[args.Shard]
+	kv.mu.Unlock()
+
 	kv.DPrintf("RPC: DeleteShard(Shard=%d, Num=%d)\n", args.Shard, args.Num)
 	// stale RPC
-	if args.Num < kv.latest_config_num_for_shards[args.Shard] {
+	if args.Num < latest_config_num {
 		reply.Err = rpc.ErrWrongGroup
 		return
 	}
 
 	// not my shard
-	if !kv.is_my_shards[args.Shard] {
+	if !is_my_shard {
 		reply.Err = rpc.OK
 		return
 	}
@@ -383,7 +397,7 @@ func (kv *KVServer) DeleteShard(args *shardrpc.DeleteShardArgs, reply *shardrpc.
 		reply.Err = rpc.ErrWrongLeader
 		return
 	}
-	
+
 	*reply = result.(shardrpc.DeleteShardReply)
 
 }
