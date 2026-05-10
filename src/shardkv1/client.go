@@ -9,6 +9,7 @@ package shardkv
 //
 
 import (
+	"log"
 	"sync"
 	"time"
 
@@ -20,6 +21,17 @@ import (
 	"6.5840/shardkv1/shardctrler"
 	tester "6.5840/tester1"
 )
+
+const Debug = false
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+const RPC_RETRY_INTERVAL = 100 * time.Millisecond
 
 type Clerk struct {
 	clnt *tester.Clnt
@@ -58,6 +70,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 		config := ck.sck.Query()
 		group_id, servers, ok := config.GidServers(shard_id)
 		if !ok || len(servers) < 1 {
+			DPrintf("[Clnt] Get(Key=%s) -> Shard %d: No group found, retrying...\n", key, shard_id)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -67,12 +80,15 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 		clerk := ck.rcks[group_id]
 		ck.lock.Unlock()
 
+		DPrintf("[Clnt] Get(Key=%s) -> Shard %d, Gid %d | Sending RPC\n", key, shard_id, group_id)
 		value, version, err := clerk.Get(key)
 
 		if err == rpc.ErrWrongGroup {
+			DPrintf("[Clnt] Get(Key=%s) -> Shard %d, Gid %d | ErrWrongGroup, refreshing config...\n", key, shard_id, group_id)
 			continue
 		}
 
+		DPrintf("[Clnt] Get(Key=%s) -> Shard %d, Gid %d | Result=%v\n", key, shard_id, group_id, err)
 		return value, version, err
 	}
 }
@@ -84,6 +100,7 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		config := ck.sck.Query()
 		group_id, servers, ok := config.GidServers(shard_id)
 		if !ok || len(servers) < 1 {
+			DPrintf("[Clnt] Put(Key=%s, Ver=%d) -> Shard %d: No group found, retrying...\n", key, version, shard_id)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -93,12 +110,16 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		clerk := ck.rcks[group_id]
 		ck.lock.Unlock()
 
+		DPrintf("[Clnt] Put(Key=%s, Ver=%d) -> Shard %d, Gid %d | Sending RPC\n", key, version, shard_id, group_id)
 		err := clerk.Put(key, value, version)
 		if err == rpc.ErrWrongGroup {
+			DPrintf("[Clnt] Put(Key=%s, Ver=%d) -> Shard %d, Gid %d | ErrWrongGroup, refreshing config...\n", key, version, shard_id, group_id)
 			continue
 		}
 
+		DPrintf("[Clnt] Put(Key=%s, Ver=%d) -> Shard %d, Gid %d | Result=%v\n", key, version, shard_id, group_id, err)
 		return err
 	}
 
 }
+
