@@ -6,6 +6,7 @@ package shardctrler
 
 import (
 	"log"
+	"time"
 
 	kvsrv "6.5840/kvsrv1"
 	"6.5840/kvsrv1/rpc"
@@ -16,6 +17,7 @@ import (
 )
 
 const Debug = false
+const RPC_RETRY_INTERVAL = 100 * time.Millisecond
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -70,75 +72,75 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // changes the configuration it may be superseded by another
 // controller.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
-	DPrintf("[Ctrler] ChangeConfigTo: Target Num=%d | Started\n", new.Num)
+	for {
+		DPrintf("[Ctrler] ChangeConfigTo: Target Num=%d | Started\n", new.Num)
 
-	old_config_str, version, err := sck.IKVClerk.Get("config")
-	if err != rpc.OK {
-		DPrintf("[Ctrler] ChangeConfigTo: Target Num=%d | Failed to get current config (Err: %v)\n", new.Num, err)
-		return
-	}
-
-	old_config := shardcfg.FromString(old_config_str)
-	if new.Num <= old_config.Num {
-		DPrintf("[Ctrler] ChangeConfigTo: Target Num=%d | Aborted (Already at Num=%d)\n", new.Num, old_config.Num)
-		return
-	}
-
-	for i := 0; i < len(old_config.Shards); i++ {
-		old_group_id := old_config.Shards[i]
-		new_group_id := new.Shards[i]
-
-		// no need to move shard
-		if old_group_id == new_group_id {
+		old_config_str, version, err := sck.IKVClerk.Get("config")
+		if err != rpc.OK {
+			DPrintf("[Ctrler] ChangeConfigTo: Target Num=%d | Failed to get current config (Err: %v)\n", new.Num, err)
+			time.Sleep(RPC_RETRY_INTERVAL)
 			continue
 		}
 
-		var shard_data []byte
-		shard_id := shardcfg.Tshid(i)
-		old_shard_group_clerk := shardgrp.MakeClerk(sck.clnt, old_config.Groups[old_group_id])
-		new_shard_group_clerk := shardgrp.MakeClerk(sck.clnt, new.Groups[new_group_id])
+		old_config := shardcfg.FromString(old_config_str)
+		if new.Num <= old_config.Num {
+			DPrintf("[Ctrler] ChangeConfigTo: Target Num=%d | Aborted (Already at Num=%d)\n", new.Num, old_config.Num)
+			return
+		}
 
-		DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Starting Move\n", shard_id, old_group_id, new_group_id)
+		is_success := true
+		for i := 0; i < len(old_config.Shards); i++ {
+			old_group_id := old_config.Shards[i]
+			new_group_id := new.Shards[i]
 
-		// all operation below, ErrWrongGroup means config is stale, we can return
-		// get and freeze old shard
-		for {
+			// no need to move shard
+			if old_group_id == new_group_id {
+				continue
+			}
+
+			var shard_data []byte
+			shard_id := shardcfg.Tshid(i)
+			old_shard_group_clerk := shardgrp.MakeClerk(sck.clnt, old_config.Groups[old_group_id])
+			new_shard_group_clerk := shardgrp.MakeClerk(sck.clnt, new.Groups[new_group_id])
+
+			DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Starting Move\n", shard_id, old_group_id, new_group_id)
+
+			// all operation below, ErrWrongGroup means config is stale, we can return
+			// get and freeze old shard
 			data, err := old_shard_group_clerk.FreezeShard(shard_id, old_config.Num)
 			DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Freeze | Err=%v\n", shard_id, old_group_id, new_group_id, err)
-			if err == rpc.ErrWrongGroup {
-				return
-			}
-			if err == rpc.OK {
-				shard_data = data
+			if err != rpc.OK {
+				is_success = false
 				break
 			}
-		}
+			shard_data = data
 
-		for {
-			err := new_shard_group_clerk.InstallShard(shard_id, shard_data, new.Num)
+			err = new_shard_group_clerk.InstallShard(shard_id, shard_data, new.Num)
 			DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Install | Err=%v\n", shard_id, old_group_id, new_group_id, err)
-			if err == rpc.ErrWrongGroup {
-				return
-			}
-			if err == rpc.OK {
+			if err != rpc.OK {
+				is_success = false
 				break
 			}
-		}
 
-		for {
 			err = old_shard_group_clerk.DeleteShard(shard_id, old_config.Num)
 			DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Delete | Err=%v\n", shard_id, old_group_id, new_group_id, err)
-			if err == rpc.ErrWrongGroup {
-				return
-			}
-			if err == rpc.OK {
+			if err != rpc.OK {
+				is_success = false
 				break
 			}
 		}
-	}
 
-	err = sck.IKVClerk.Put("config", new.String(), version)
-	DPrintf("[Ctrler] ChangeConfigTo: Target Num=%d | PutConfig Result=%v\n", new.Num, err)
+		if !is_success {
+			time.Sleep(RPC_RETRY_INTERVAL)
+			continue
+		}
+
+		err = sck.IKVClerk.Put("config", new.String(), version)
+		DPrintf("[Ctrler] ChangeConfigTo: Target Num=%d | PutConfig Result=%v\n", new.Num, err)
+		if err == rpc.OK {
+			return
+		}
+	}
 }
 
 // Return the current configuration
