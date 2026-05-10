@@ -72,6 +72,7 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // changes the configuration it may be superseded by another
 // controller.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
+	curr_index := 0
 	for {
 		DPrintf("[Ctrler] ChangeConfigTo: Target Num=%d | Started\n", new.Num)
 
@@ -89,9 +90,9 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		}
 
 		is_success := true
-		for i := 0; i < len(old_config.Shards); i++ {
-			old_group_id := old_config.Shards[i]
-			new_group_id := new.Shards[i]
+		for ; curr_index < len(new.Shards); curr_index++ {
+			old_group_id := old_config.Shards[curr_index]
+			new_group_id := new.Shards[curr_index]
 
 			// no need to move shard
 			if old_group_id == new_group_id {
@@ -99,7 +100,7 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 			}
 
 			var shard_data []byte
-			shard_id := shardcfg.Tshid(i)
+			shard_id := shardcfg.Tshid(curr_index)
 			old_shard_group_clerk := shardgrp.MakeClerk(sck.clnt, old_config.Groups[old_group_id])
 			new_shard_group_clerk := shardgrp.MakeClerk(sck.clnt, new.Groups[new_group_id])
 
@@ -140,6 +141,7 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		if err == rpc.OK {
 			return
 		}
+		time.Sleep(RPC_RETRY_INTERVAL)
 	}
 }
 
