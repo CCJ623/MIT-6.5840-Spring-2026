@@ -31,7 +31,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-const RPC_RETRY_INTERVAL = 1 * time.Millisecond
+const RPC_RETRY_INTERVAL = 10 * time.Millisecond
 
 type Clerk struct {
 	clnt *tester.Clnt
@@ -71,7 +71,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 		group_id, servers, ok := config.GidServers(shard_id)
 		if !ok || len(servers) < 1 {
 			DPrintf("[Clnt] Get(Key=%s) -> Shard %d: No group found, retrying...\n", key, shard_id)
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(RPC_RETRY_INTERVAL)
 			continue
 		}
 
@@ -101,7 +101,7 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		group_id, servers, ok := config.GidServers(shard_id)
 		if !ok || len(servers) < 1 {
 			DPrintf("[Clnt] Put(Key=%s, Ver=%d) -> Shard %d: No group found, retrying...\n", key, version, shard_id)
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(RPC_RETRY_INTERVAL)
 			continue
 		}
 

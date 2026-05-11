@@ -20,7 +20,7 @@ func GCDPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-const RPC_RETRY_INTERVAL = 1 * time.Millisecond
+const RPC_RETRY_INTERVAL = 10 * time.Millisecond
 
 type Clerk struct {
 	*tester.Clnt

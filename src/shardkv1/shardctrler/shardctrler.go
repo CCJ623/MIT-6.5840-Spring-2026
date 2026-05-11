@@ -6,6 +6,8 @@ package shardctrler
 
 import (
 	"log"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	kvsrv "6.5840/kvsrv1"
@@ -17,7 +19,7 @@ import (
 )
 
 const Debug = true
-const RPC_RETRY_INTERVAL = 1 * time.Millisecond
+const RPC_RETRY_INTERVAL = 10 * time.Millisecond
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -72,7 +74,6 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // changes the configuration it may be superseded by another
 // controller.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
-	curr_index := 0
 	for {
 		DPrintf("[Ctrler] ChangeConfigTo: Target Num=%d | Started\n", new.Num)
 
@@ -89,53 +90,60 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 			return
 		}
 
-		is_success := true
-		for ; curr_index < len(new.Shards); curr_index++ {
-			old_group_id := old_config.Shards[curr_index]
-			new_group_id := new.Shards[curr_index]
+		var is_success atomic.Bool
+		is_success.Store(true)
+		var wait_group sync.WaitGroup
+		for i := 0; i < len(new.Shards); i++ {
+			old_group_id := old_config.Shards[i]
+			new_group_id := new.Shards[i]
 
 			// no need to move shard
 			if old_group_id == new_group_id {
 				continue
 			}
 
-			shard_id := shardcfg.Tshid(curr_index)
-			old_shard_group_clerk := shardgrp.MakeClerk(sck.clnt, old_config.Groups[old_group_id])
-			new_shard_group_clerk := shardgrp.MakeClerk(sck.clnt, new.Groups[new_group_id])
+			wait_group.Add(1)
+			go func(shard_id shardcfg.Tshid, old_group_id, new_group_id tester.Tgid) {
+				defer wait_group.Done()
 
-			DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Starting Move\n", shard_id, old_group_id, new_group_id)
+				old_shard_group_clerk := shardgrp.MakeClerk(sck.clnt, old_config.Groups[old_group_id])
+				new_shard_group_clerk := shardgrp.MakeClerk(sck.clnt, new.Groups[new_group_id])
 
-			// all operation below, ErrWrongGroup means config is stale, we need to refresh config
-			// get and freeze old shard
-			data, err := old_shard_group_clerk.FreezeShard(shard_id, new.Num)
-			DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Freeze | Err=%v\n", shard_id, old_group_id, new_group_id, err)
-			if err != rpc.OK {
-				is_success = false
-				break
-			}
-			// duplicate request, already done
-			if len(data) == 0 {
-				DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Freeze | Duplicate\n", shard_id, old_group_id, new_group_id)
-				continue
-			}
-			shard_data := data
+				DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Starting Move\n", shard_id, old_group_id, new_group_id)
 
-			err = new_shard_group_clerk.InstallShard(shard_id, shard_data, new.Num)
-			DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Install | Err=%v\n", shard_id, old_group_id, new_group_id, err)
-			if err != rpc.OK {
-				is_success = false
-				break
-			}
+				// all operation below, ErrWrongGroup means config is stale, we need to refresh config
+				// get and freeze old shard
+				data, err := old_shard_group_clerk.FreezeShard(shard_id, new.Num)
+				DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Freeze | Err=%v\n", shard_id, old_group_id, new_group_id, err)
+				if err != rpc.OK {
+					is_success.Store(false)
+					return
+				}
+				// duplicate request, already done
+				if len(data) == 0 {
+					DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Freeze | Duplicate\n", shard_id, old_group_id, new_group_id)
+					return
+				}
+				shard_data := data
 
-			err = old_shard_group_clerk.DeleteShard(shard_id, new.Num)
-			DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Delete | Err=%v\n", shard_id, old_group_id, new_group_id, err)
-			if err != rpc.OK {
-				is_success = false
-				break
-			}
+				err = new_shard_group_clerk.InstallShard(shard_id, shard_data, new.Num)
+				DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Install | Err=%v\n", shard_id, old_group_id, new_group_id, err)
+				if err != rpc.OK {
+					is_success.Store(false)
+					return
+				}
+
+				err = old_shard_group_clerk.DeleteShard(shard_id, new.Num)
+				DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Delete | Err=%v\n", shard_id, old_group_id, new_group_id, err)
+				if err != rpc.OK {
+					is_success.Store(false)
+					return
+				}
+			}(shardcfg.Tshid(i), old_group_id, new_group_id)
 		}
 
-		if !is_success {
+		wait_group.Wait()
+		if !is_success.Load() {
 			time.Sleep(RPC_RETRY_INTERVAL)
 			continue
 		}
