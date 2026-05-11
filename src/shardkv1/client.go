@@ -66,6 +66,7 @@ func (ck *Clerk) GetClerk(gid tester.Tgid) (*shardgrp.Clerk, bool) {
 // calling shardgrp.MakeClerk(ck.clnt, servers).
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	shard_id := shardcfg.Key2Shard(key)
+	var old_servers []string
 	for {
 		config := ck.sck.Query()
 		group_id, servers, ok := config.GidServers(shard_id)
@@ -76,12 +77,26 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 		}
 
 		ck.lock.Lock()
-		ck.rcks[group_id] = shardgrp.MakeClerk(ck.clnt, servers)
+		// only make new clerk when servers changed
+		if len(old_servers) != len(servers) {
+			ck.rcks[group_id] = shardgrp.MakeClerk(ck.clnt, servers)
+		} else if len(servers) > 0 {
+			for i, server := range servers {
+				if old_servers[i] != server {
+					ck.rcks[group_id] = shardgrp.MakeClerk(ck.clnt, servers)
+					break
+				}
+			}
+		}
 		clerk := ck.rcks[group_id]
 		ck.lock.Unlock()
 
 		DPrintf("[Clnt] Get(Key=%s) -> Shard %d, Gid %d | Sending RPC\n", key, shard_id, group_id)
 		value, version, err := clerk.Get(key)
+
+		if err != rpc.OK && err != rpc.ErrNoKey && err != rpc.ErrWrongGroup {
+			panic("invalid get replly")
+		}
 
 		if err == rpc.ErrWrongGroup {
 			DPrintf("[Clnt] Get(Key=%s) -> Shard %d, Gid %d | ErrWrongGroup, refreshing config...\n", key, shard_id, group_id)
@@ -96,6 +111,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // Put a key to a shard group.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	shard_id := shardcfg.Key2Shard(key)
+	var old_servers []string
 	for {
 		config := ck.sck.Query()
 		group_id, servers, ok := config.GidServers(shard_id)
@@ -106,12 +122,27 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		}
 
 		ck.lock.Lock()
-		ck.rcks[group_id] = shardgrp.MakeClerk(ck.clnt, servers)
+		// only make new clerk when servers changed
+		if len(old_servers) != len(servers) {
+			ck.rcks[group_id] = shardgrp.MakeClerk(ck.clnt, servers)
+		} else if len(servers) > 0 {
+			for i, server := range servers {
+				if old_servers[i] != server {
+					ck.rcks[group_id] = shardgrp.MakeClerk(ck.clnt, servers)
+					break
+				}
+			}
+		}
 		clerk := ck.rcks[group_id]
 		ck.lock.Unlock()
 
 		DPrintf("[Clnt] Put(Key=%s, Ver=%d) -> Shard %d, Gid %d | Sending RPC\n", key, version, shard_id, group_id)
 		err := clerk.Put(key, value, version)
+
+		if err != rpc.OK && err != rpc.ErrNoKey && err != rpc.ErrWrongGroup && err != rpc.ErrMaybe {
+			panic("invalid put replly")
+		}
+
 		if err == rpc.ErrWrongGroup {
 			DPrintf("[Clnt] Put(Key=%s, Ver=%d) -> Shard %d, Gid %d | ErrWrongGroup, refreshing config...\n", key, version, shard_id, group_id)
 			continue
@@ -122,4 +153,3 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	}
 
 }
-

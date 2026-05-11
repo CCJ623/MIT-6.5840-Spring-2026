@@ -346,7 +346,7 @@ func (kv *KVServer) FreezeShard(args *shardrpc.FreezeShardArgs, reply *shardrpc.
 		reply.Num = latest_config_num
 		reply.State = []byte{}
 		kv.DPrintf("RPC: FreezeShard(Shard=%d, Num=%d) -> OK (duplicate request)\n", args.Shard, args.Num)
-		return 
+		return
 	}
 
 	// not my shard
@@ -392,7 +392,7 @@ func (kv *KVServer) InstallShard(args *shardrpc.InstallShardArgs, reply *shardrp
 	}
 
 	*reply = result.(shardrpc.InstallShardReply)
-	kv.DPrintf("RPC: InstallShard(Shard=%d, Num=%d) -> ErrWrongGroup (Stale: Latest=%d)\n", args.Shard, args.Num, kv.latest_config_num_for_shards[args.Shard])
+	kv.DPrintf("RPC: InstallShard(Shard=%d, Num=%d) -> Result=%v\n", args.Shard, args.Num, reply.Err)
 }
 
 // Delete the specified shard.
@@ -438,10 +438,15 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(rpc.PutArgs{})
+	labgob.Register(rpc.PutReply{})
 	labgob.Register(rpc.GetArgs{})
+	labgob.Register(rpc.GetReply{})
 	labgob.Register(shardrpc.FreezeShardArgs{})
+	labgob.Register(shardrpc.FreezeShardReply{})
 	labgob.Register(shardrpc.InstallShardArgs{})
+	labgob.Register(shardrpc.InstallShardReply{})
 	labgob.Register(shardrpc.DeleteShardArgs{})
+	labgob.Register(shardrpc.DeleteShardReply{})
 	labgob.Register(rsm.Op{})
 	labgob.Register(shardcfg.ShardConfig{})
 

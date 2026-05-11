@@ -18,7 +18,7 @@ import (
 	tester "6.5840/tester1"
 )
 
-const Debug = true
+const Debug = false
 const RPC_RETRY_INTERVAL = 10 * time.Millisecond
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -88,6 +88,12 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 		if new.Num <= old_config.Num {
 			DPrintf("[Ctrler] ChangeConfigTo: Target Num=%d | Aborted (Already at Num=%d)\n", new.Num, old_config.Num)
 			return
+		}
+
+		if new.Num != old_config.Num+1 {
+			DPrintf("[Ctrler] ChangeConfigTo: Target Num=%d | current config not catch up\n", new.Num)
+			time.Sleep(RPC_RETRY_INTERVAL)
+			continue
 		}
 
 		var is_success atomic.Bool

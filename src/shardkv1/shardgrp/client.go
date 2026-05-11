@@ -20,7 +20,7 @@ func GCDPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-const RPC_RETRY_INTERVAL = 10 * time.Millisecond
+const RPC_RETRY_INTERVAL = 1 * time.Millisecond
 
 type Clerk struct {
 	*tester.Clnt
@@ -32,7 +32,7 @@ type Clerk struct {
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) *Clerk {
-	ck := &Clerk{Clnt: clnt, servers: servers, rpc_max_retry_times: uint(len(servers) * 2)}
+	ck := &Clerk{Clnt: clnt, servers: servers, rpc_max_retry_times: uint(len(servers) * 10)}
 
 	return ck
 }
@@ -46,17 +46,17 @@ func (ck *Clerk) Leader() int {
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	args := rpc.GetArgs{Key: key}
 	reply := rpc.GetReply{}
-	retry_times := uint(0)
+	send_times := uint(0)
 
 	for {
 		leader := ck.Leader()
 		GCDPrintf("[GrpClnt] RPC: Get(Key=%s) -> Srv %d\n", key, leader)
 		ok := ck.Clnt.Call(ck.servers[leader], "KVServer.Get", &args, &reply)
+		send_times++
 
-		// network failed or some error
-		if !ok || reply.Err == rpc.ErrWrongLeader {
-			retry_times++
-			if retry_times >= ck.rpc_max_retry_times {
+		// network failed
+		if !ok {
+			if send_times >= ck.rpc_max_retry_times {
 				return "", 0, rpc.ErrWrongGroup
 			}
 
@@ -67,7 +67,22 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 			}
 			ck.lock.Unlock()
 
-			GCDPrintf("[GrpClnt] RPC: Get(Key=%s) -> Srv %d | Failed/WrongLeader (ok=%v, err=%v)\n", key, leader, ok, reply.Err)
+			GCDPrintf("[GrpClnt] RPC: Get(Key=%s) -> Srv %d | Failed\n", key, leader)
+			time.Sleep(RPC_RETRY_INTERVAL)
+			continue
+		}
+
+		// wrong leader, keep trying
+		if reply.Err == rpc.ErrWrongLeader {
+
+			ck.lock.Lock()
+			curr_leader := ck.leader
+			if curr_leader == leader {
+				ck.leader = (ck.leader + 1) % len(ck.servers)
+			}
+			ck.lock.Unlock()
+
+			GCDPrintf("[GrpClnt] RPC: Get(Key=%s) -> Srv %d | WrongLeader\n", key, leader)
 			time.Sleep(RPC_RETRY_INTERVAL)
 			continue
 		}
@@ -80,19 +95,19 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	args := rpc.PutArgs{Key: key, Value: value, Version: version}
 	reply := rpc.PutReply{}
-	is_resend_ := false
-	retry_times := uint(0)
+	send_times := uint(0)
 
 	for {
 		leader := ck.Leader()
 		GCDPrintf("[GrpClnt] RPC: Put(Key=%s, Ver=%d) -> Srv %d\n", key, version, leader)
 		ok := ck.Clnt.Call(ck.servers[leader], "KVServer.Put", &args, &reply)
+		send_times++
 
-		// network error or wrong leader
-		if !ok || reply.Err == rpc.ErrWrongLeader {
-			retry_times++
-			if retry_times >= ck.rpc_max_retry_times {
-				return rpc.ErrWrongGroup
+		// network failed
+		if !ok {
+
+			if send_times >= ck.rpc_max_retry_times {
+				return rpc.ErrMaybe
 			}
 
 			ck.lock.Lock()
@@ -102,21 +117,34 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 			}
 			ck.lock.Unlock()
 
-			GCDPrintf("[GrpClnt] RPC: Put(Key=%s, Ver=%d) -> Srv %d | Failed/WrongLeader (ok=%v, err=%v)\n", key, version, leader, ok, reply.Err)
-			is_resend_ = true
+			GCDPrintf("[GrpClnt] RPC: Get(Key=%s) -> Srv %d | Failed\n", key, leader)
 			time.Sleep(RPC_RETRY_INTERVAL)
+			continue
+		}
 
+		// wrong leader, keep trying
+		if reply.Err == rpc.ErrWrongLeader {
+
+			ck.lock.Lock()
+			curr_leader := ck.leader
+			if curr_leader == leader {
+				ck.leader = (ck.leader + 1) % len(ck.servers)
+			}
+			ck.lock.Unlock()
+
+			GCDPrintf("[GrpClnt] RPC: Get(Key=%s) -> Srv %d | WrongLeader\n", key, leader)
+			time.Sleep(RPC_RETRY_INTERVAL)
 			continue
 		}
 
 		// error version
-		if reply.Err == rpc.ErrVersion && !is_resend_ {
+		if reply.Err == rpc.ErrVersion && send_times == 1 {
 			GCDPrintf("[GrpClnt] RPC: Put(Key=%s, Ver=%d) -> Srv %d | ErrVersion\n", key, version, leader)
 			return rpc.ErrVersion
 		}
 
 		// unsure
-		if reply.Err == rpc.ErrVersion && is_resend_ {
+		if reply.Err == rpc.ErrVersion && send_times > 1 {
 			GCDPrintf("[GrpClnt] RPC: Put(Key=%s, Ver=%d) -> Srv %d | ErrMaybe\n", key, version, leader)
 			return rpc.ErrMaybe
 		}
