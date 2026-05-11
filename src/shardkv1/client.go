@@ -103,7 +103,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 			continue
 		}
 
-		DPrintf("[Clnt] Get(Key=%s) -> Shard %d, Gid %d | Result=%v\n", key, shard_id, group_id, err)
+		DPrintf("[Clnt] Get(Key=%s) -> Shard %d, Gid %d | (Value=%v) (Version=%v) (Result=%v)\n", key, shard_id, group_id, value, version, err)
 		return value, version, err
 	}
 }
@@ -139,7 +139,8 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		DPrintf("[Clnt] Put(Key=%s, Ver=%d) -> Shard %d, Gid %d | Sending RPC\n", key, version, shard_id, group_id)
 		err := clerk.Put(key, value, version)
 
-		if err != rpc.OK && err != rpc.ErrNoKey && err != rpc.ErrWrongGroup && err != rpc.ErrMaybe {
+		if err != rpc.OK && err != rpc.ErrNoKey && err != rpc.ErrWrongGroup && err != rpc.ErrMaybe && err != rpc.ErrVersion {
+			DPrintf("[Clnt] Put(Key=%s, Ver=%d) -> Shard %d, Gid %d | Invalid err: %v\n", key, version, shard_id, group_id, err)
 			panic("invalid put replly")
 		}
 

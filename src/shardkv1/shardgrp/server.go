@@ -58,7 +58,7 @@ func (kv *KVServer) DoOp(req any) any {
 		shard_id := shardcfg.Key2Shard(args.Key)
 		if !kv.is_my_shards[shard_id] {
 			reply.Err = rpc.ErrWrongGroup
-			kv.DPrintf("DoOp: Get(Key=%s) -> ErrWrongGroup\n", args.Key)
+			kv.DPrintf("DoOp: Get(Key=%s) -> ErrWrongGroup (Not mine)\n", args.Key)
 			return reply
 		}
 
@@ -177,6 +177,13 @@ func (kv *KVServer) DoOp(req any) any {
 		if args.Num < kv.latest_config_num_for_shards[args.Shard] {
 			reply.Err = rpc.ErrWrongGroup
 			kv.DPrintf("DoOp: InstallShard(Shard=%d, Num=%d) -> ErrWrongGroup (Stale: Latest=%d)\n", args.Shard, args.Num, kv.latest_config_num_for_shards[args.Shard])
+			return reply
+		}
+
+		// duplicate RPC
+		if args.Num == kv.latest_config_num_for_shards[args.Shard] {
+			reply.Err = rpc.OK
+			kv.DPrintf("DoOp: InstallShard(Shard=%d, Num=%d) -> OK (duplicate request)\n", args.Shard, args.Num)
 			return reply
 		}
 
@@ -381,6 +388,13 @@ func (kv *KVServer) InstallShard(args *shardrpc.InstallShardArgs, reply *shardrp
 		reply.Err = rpc.ErrWrongGroup
 		kv.DPrintf("RPC: InstallShard(Shard=%d, Num=%d) -> ErrWrongGroup (Stale: Latest=%d)\n", args.Shard, args.Num, kv.latest_config_num_for_shards[args.Shard])
 		return
+	}
+
+	// duplicate RPC
+	if args.Num == latest_config_num {
+		reply.Err = rpc.OK
+		kv.DPrintf("RPC: InstallShard(Shard=%d, Num=%d) -> OK (duplicate request)\n", args.Shard, args.Num)
+		return 
 	}
 
 	error, result := kv.rsm.Submit(*args)
