@@ -16,8 +16,8 @@ import (
 	tester "6.5840/tester1"
 )
 
-const Debug = false
-const RPC_RETRY_INTERVAL = 100 * time.Millisecond
+const Debug = true
+const RPC_RETRY_INTERVAL = 1 * time.Millisecond
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -99,22 +99,26 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 				continue
 			}
 
-			var shard_data []byte
 			shard_id := shardcfg.Tshid(curr_index)
 			old_shard_group_clerk := shardgrp.MakeClerk(sck.clnt, old_config.Groups[old_group_id])
 			new_shard_group_clerk := shardgrp.MakeClerk(sck.clnt, new.Groups[new_group_id])
 
 			DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Starting Move\n", shard_id, old_group_id, new_group_id)
 
-			// all operation below, ErrWrongGroup means config is stale, we can return
+			// all operation below, ErrWrongGroup means config is stale, we need to refresh config
 			// get and freeze old shard
-			data, err := old_shard_group_clerk.FreezeShard(shard_id, old_config.Num)
+			data, err := old_shard_group_clerk.FreezeShard(shard_id, new.Num)
 			DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Freeze | Err=%v\n", shard_id, old_group_id, new_group_id, err)
 			if err != rpc.OK {
 				is_success = false
 				break
 			}
-			shard_data = data
+			// duplicate request, already done
+			if len(data) == 0 {
+				DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Freeze | Duplicate\n", shard_id, old_group_id, new_group_id)
+				continue
+			}
+			shard_data := data
 
 			err = new_shard_group_clerk.InstallShard(shard_id, shard_data, new.Num)
 			DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Install | Err=%v\n", shard_id, old_group_id, new_group_id, err)
@@ -123,7 +127,7 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 				break
 			}
 
-			err = old_shard_group_clerk.DeleteShard(shard_id, old_config.Num)
+			err = old_shard_group_clerk.DeleteShard(shard_id, new.Num)
 			DPrintf("[Ctrler] Shard=%d | Move Gid=%d -> Gid=%d | Delete | Err=%v\n", shard_id, old_group_id, new_group_id, err)
 			if err != rpc.OK {
 				is_success = false

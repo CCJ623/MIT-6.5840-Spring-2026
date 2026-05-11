@@ -20,7 +20,7 @@ func GCDPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-const RPC_RETRY_INTERVAL = 100 * time.Millisecond
+const RPC_RETRY_INTERVAL = 1 * time.Millisecond
 
 type Clerk struct {
 	*tester.Clnt
@@ -141,7 +141,11 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 		if !ok || reply.Err == rpc.ErrWrongLeader {
 			retry_times++
 			if retry_times >= ck.rpc_max_retry_times {
-				return []byte{}, rpc.ErrWrongGroup
+				if !ok {
+					return []byte{}, rpc.ErrMaybe
+				} else {
+					return []byte{}, reply.Err
+				}
 			}
 
 			ck.lock.Lock()
@@ -175,7 +179,11 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 		if !ok || reply.Err == rpc.ErrWrongLeader {
 			retry_times++
 			if retry_times >= ck.rpc_max_retry_times {
-				return rpc.ErrWrongGroup
+				if !ok {
+					return rpc.ErrMaybe
+				} else {
+					return reply.Err
+				}
 			}
 
 			ck.lock.Lock()
@@ -209,7 +217,11 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 		if !ok || reply.Err == rpc.ErrWrongLeader {
 			retry_times++
 			if retry_times >= ck.rpc_max_retry_times {
-				return rpc.ErrWrongGroup
+				if !ok {
+					return rpc.ErrMaybe
+				} else {
+					return reply.Err
+				}
 			}
 
 			ck.lock.Lock()

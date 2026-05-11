@@ -125,13 +125,24 @@ func (kv *KVServer) DoOp(req any) any {
 		// stale RPC
 		if args.Num < kv.latest_config_num_for_shards[args.Shard] {
 			reply.Err = rpc.ErrWrongGroup
+			reply.Num = kv.latest_config_num_for_shards[args.Shard]
 			kv.DPrintf("DoOp: FreezeShard(Shard=%d, Num=%d) -> ErrWrongGroup (Stale: Latest=%d)\n", args.Shard, args.Num, kv.latest_config_num_for_shards[args.Shard])
+			return reply
+		}
+
+		// duplicate request, send empty data to remind caller
+		if args.Num == kv.latest_config_num_for_shards[args.Shard] && !kv.is_my_shards[args.Shard] {
+			reply.Err = rpc.OK
+			reply.Num = kv.latest_config_num_for_shards[args.Shard]
+			reply.State = []byte{}
+			kv.DPrintf("DoOp: FreezeShard(Shard=%d, Num=%d) -> OK (duplicate request)\n", args.Shard, args.Num)
 			return reply
 		}
 
 		// not my shard
 		if !kv.is_my_shards[args.Shard] {
 			reply.Err = rpc.ErrWrongGroup
+			reply.Num = kv.latest_config_num_for_shards[args.Shard]
 			kv.DPrintf("DoOp: FreezeShard(Shard=%d, Num=%d) -> ErrWrongGroup (Not mine)\n", args.Shard, args.Num)
 			return reply
 		}
@@ -324,12 +335,25 @@ func (kv *KVServer) FreezeShard(args *shardrpc.FreezeShardArgs, reply *shardrpc.
 	// stale RPC
 	if args.Num < latest_config_num {
 		reply.Err = rpc.ErrWrongGroup
+		reply.Num = latest_config_num
+		kv.DPrintf("RPC: FreezeShard(Shard=%d, Num=%d) -> ErrWrongGroup (Stale: Latest=%d)\n", args.Shard, args.Num, kv.latest_config_num_for_shards[args.Shard])
 		return
+	}
+
+	// duplicate request, send empty data to remind caller
+	if args.Num == latest_config_num && !is_my_shard {
+		reply.Err = rpc.OK
+		reply.Num = latest_config_num
+		reply.State = []byte{}
+		kv.DPrintf("RPC: FreezeShard(Shard=%d, Num=%d) -> OK (duplicate request)\n", args.Shard, args.Num)
+		return 
 	}
 
 	// not my shard
 	if !is_my_shard {
 		reply.Err = rpc.ErrWrongGroup
+		reply.Num = latest_config_num
+		kv.DPrintf("RPC: FreezeShard(Shard=%d, Num=%d) -> ErrWrongGroup (Not mine)\n", args.Shard, args.Num)
 		return
 	}
 
@@ -355,6 +379,7 @@ func (kv *KVServer) InstallShard(args *shardrpc.InstallShardArgs, reply *shardrp
 	// stale RPC
 	if args.Num < latest_config_num {
 		reply.Err = rpc.ErrWrongGroup
+		kv.DPrintf("RPC: InstallShard(Shard=%d, Num=%d) -> ErrWrongGroup (Stale: Latest=%d)\n", args.Shard, args.Num, kv.latest_config_num_for_shards[args.Shard])
 		return
 	}
 
@@ -367,7 +392,7 @@ func (kv *KVServer) InstallShard(args *shardrpc.InstallShardArgs, reply *shardrp
 	}
 
 	*reply = result.(shardrpc.InstallShardReply)
-
+	kv.DPrintf("RPC: InstallShard(Shard=%d, Num=%d) -> ErrWrongGroup (Stale: Latest=%d)\n", args.Shard, args.Num, kv.latest_config_num_for_shards[args.Shard])
 }
 
 // Delete the specified shard.
@@ -378,15 +403,18 @@ func (kv *KVServer) DeleteShard(args *shardrpc.DeleteShardArgs, reply *shardrpc.
 	kv.mu.Unlock()
 
 	kv.DPrintf("RPC: DeleteShard(Shard=%d, Num=%d)\n", args.Shard, args.Num)
+
 	// stale RPC
 	if args.Num < latest_config_num {
 		reply.Err = rpc.ErrWrongGroup
+		kv.DPrintf("RPC: DeleteShard(Shard=%d, Num=%d) -> ErrWrongGroup (Stale: Latest=%d)\n", args.Shard, args.Num, kv.latest_config_num_for_shards[args.Shard])
 		return
 	}
 
 	// not my shard
 	if !is_my_shard {
 		reply.Err = rpc.OK
+		kv.DPrintf("RPC: DeleteShard(Shard=%d, Num=%d) -> OK (Already not mine)\n", args.Shard, args.Num)
 		return
 	}
 

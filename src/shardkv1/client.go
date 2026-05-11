@@ -31,7 +31,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-const RPC_RETRY_INTERVAL = 100 * time.Millisecond
+const RPC_RETRY_INTERVAL = 1 * time.Millisecond
 
 type Clerk struct {
 	clnt *tester.Clnt
