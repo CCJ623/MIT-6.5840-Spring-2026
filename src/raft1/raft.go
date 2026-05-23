@@ -743,17 +743,16 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			// i have been through it's term in previous log
 			// try to find it
 			start_index := args.PreviousLogIndex_
-			for ; rf.getLogEntry(start_index).Term_ != reply.ConflictEntryTerm_ &&
-				start_index > 0; start_index-- {
+			for ; start_index > rf.last_included_index_ && rf.getLogEntry(start_index).Term_ > reply.ConflictEntryTerm_; start_index-- {
 			}
 
-			if start_index == 0 {
-				// i don't have it's term
-				new_next_index = reply.FirstIndexOfConflictEntryTerm_
-			} else {
+			if start_index > rf.last_included_index_ && rf.getLogEntry(start_index).Term_ == reply.ConflictEntryTerm_ {
 				// i have it's term
 				// now it's our common history
 				new_next_index = start_index + 1
+			} else {
+				// i don't have it's term
+				new_next_index = reply.FirstIndexOfConflictEntryTerm_
 			}
 		}
 
